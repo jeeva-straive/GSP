@@ -6,13 +6,13 @@
   "main": "electron/main.js",
   "scripts": {
     "ng": "ng",
-    "start": "node main.js",
+    "start": "ng serve",
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
     "test": "ng test",
     "electron:dev": "concurrently -k \"ng serve\" \"wait-on http://localhost:4200 && electron .\"",
     "electron:build": "npm run build -- --base-href ./ && electron-builder -w",
-    "start1": "node main.js"
+    "start1": "node server.js"
   },
   "private": true,
   "dependencies": {

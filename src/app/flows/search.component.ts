@@ -521,7 +521,7 @@ export class SearchComponent {
       }
     }
     this.http
-      .get<SearchResponse>('https://gsp-coxk.onrender.com/search', {
+      .get<SearchResponse>('http://localhost:3000/search', {
         params,
       })
       .subscribe({
