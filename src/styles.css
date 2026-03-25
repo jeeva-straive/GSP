@@ -1,0 +1,5 @@
+/* Global styles */
+.list-group .list-group-item.active {
+  background-color: #0d6efd;
+  border-color: #0d6efd;
+}

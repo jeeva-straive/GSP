@@ -1,0 +1,71 @@
+                });
+
+                if (
+                  perPageMatchLimit > 0 &&
+                  matches.length >= perPageMatchLimit
+                ) {
+                  break;
+                }
+              }
+
+              return perPageMatchLimit > 0
+                ? matches.slice(0, perPageMatchLimit)
+                : matches;
+            },
+              {
+                keyword: config.keyword,
+                matchMode: config.matchMode,
+                nodeLimit: KEYWORD_SCAN_NODE_LIMIT,
+                perPageMatchLimit,
+                scanTimeoutMs: KEYWORD_SCAN_TIMEOUT_MS,
+                nodeTextLimit: KEYWORD_NODE_TEXT_LIMIT,
+              },
+            );
+
+            if (Array.isArray(pageMatches) && pageMatches.length) {
+              const bucket = keywordMatchBuckets.get(config.keyword);
+              if (!bucket) continue;
+              for (const match of pageMatches) {
+                if (
+                  matchLimit !== null &&
+                  bucket.length >= matchLimit
+                ) {
+                  break;
+                }
+                bucket.push({
+                  ...match,
+                  pageUrl: current,
+                });
+              }
+            }
+          }
+        } catch (err) {
+          console.warn("Keyword extraction failed:", err && err.message);
+        }
+
+        let prioritizedLinks = [];
+        try {
+          prioritizedLinks = await page.evaluate(
+            ({ seedUrl, pattern, flags }) => {
+              const anchors = Array.from(document.querySelectorAll("a[href]"));
+              const seen = new Set();
+              const collected = [];
+              let source = null;
+              const regex = new RegExp(pattern, flags);
+              try {
+                source = new URL(seedUrl);
+              } catch {
+                source = null;
+              }
+
+              for (const anchor of anchors) {
+                const href = anchor.getAttribute("href");
+                if (!href) continue;
+                let normalized;
+                try {
+                  normalized = new URL(href, seedUrl).href;
+                } catch {
+                  continue;
+                }
+                if (seen.has(normalized)) continue;
+

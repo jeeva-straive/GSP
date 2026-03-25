@@ -1,0 +1,196 @@
+              remainingBudgetForKeyword !== null &&
+              remainingBudgetForKeyword > 0
+                ? Math.min(
+                    remainingBudgetForKeyword,
+                    KEYWORD_PAGE_MATCH_LIMIT,
+                  )
+                : KEYWORD_PAGE_MATCH_LIMIT;
+            const pageMatches = await page.evaluate(
+              ({
+                keyword,
+                matchMode,
+                nodeLimit,
+                perPageMatchLimit,
+                scanTimeoutMs,
+                nodeTextLimit,
+              }) => {
+              const clean = (value = "") => value.replace(/\s+/g, " ").trim();
+              const escapeRegex = (value = "") =>
+                value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              const normalized = (keyword || "").trim();
+              if (!normalized) return [];
+              const hasPerf =
+                typeof performance !== "undefined" &&
+                typeof performance.now === "function";
+              const now = () => (hasPerf ? performance.now() : Date.now());
+              const deadline =
+                now() + Math.max(500, Number(scanTimeoutMs) || 0);
+              const timedOut = () => now() >= deadline;
+
+              const lower = normalized.toLowerCase();
+              const synonyms = new Set([normalized, lower]);
+
+              if (/chief executive officer|ceo/i.test(normalized)) {
+                synonyms.add("chief executive officer");
+                synonyms.add("ceo");
+              }
+              if (
+                /employee|headcount|team size|people|staff|associate|member|workforce/i.test(
+                  normalized,
+                )
+              ) {
+                synonyms.add("employee");
+                synonyms.add("employees");
+                synonyms.add("team size");
+                synonyms.add("headcount");
+                synonyms.add("people");
+                synonyms.add("staff");
+                synonyms.add("associates");
+                synonyms.add("members");
+              }
+
+              const labels = Array.from(synonyms).filter(Boolean);
+              if (!labels.length) labels.push(lower);
+
+              const labelRegex = new RegExp(
+                labels
+                  .map((label) => escapeRegex(label.toLowerCase()))
+                  .join("|"),
+                "i",
+              );
+
+              const findNumber = (text = "") => {
+                const pattern =
+                  /(?:over|more than|approximately|about)?\s*(\d[\d,\.]*\s*(?:\+|plus)?)/gi;
+                let match;
+                let candidate = null;
+                while ((match = pattern.exec(text))) {
+                  candidate = match[1];
+                }
+                return candidate ? candidate.trim() : null;
+              };
+
+              const extractValue = (text = "") => {
+                for (const label of labels) {
+                  const esc = escapeRegex(label);
+                  const forward = new RegExp(
+                    `${esc}\\s*[:\\-–]\\s*(.+)`,
+                    "i",
+                  ).exec(text);
+                  if (forward && forward[1]) return clean(forward[1]);
+                  const reverse = new RegExp(
+                    `(.+)\\s*[:\\-–]\\s*${esc}`,
+                    "i",
+                  ).exec(text);
+                  if (reverse && reverse[1]) return clean(reverse[1]);
+                }
+                return null;
+              };
+              const buildKeywordSnippet = (text = "") => {
+                if (!text) return "";
+                const snippetRegex = new RegExp(
+                  labelRegex.source,
+                  labelRegex.flags,
+                );
+                const match = snippetRegex.exec(text);
+                if (!match || typeof match.index !== "number") {
+                  return text.slice(0, 280).trim();
+                }
+                const window = 120;
+                const start = Math.max(match.index - window, 0);
+                const end = Math.min(
+                  match.index + match[0].length + window,
+                  text.length,
+                );
+                return text.slice(start, end).trim();
+              };
+
+              const selectors = [
+                "article",
+                "section",
+                "li",
+                "div",
+                "tr",
+                "p",
+                "h1",
+                "h2",
+                "h3",
+                "h4",
+                "h5",
+                "h6",
+                "dt",
+                "dd",
+                "span",
+              ];
+              const nodes = [];
+              const safeNodeLimit = Math.max(500, Number(nodeLimit) || 0);
+              outer: for (const selector of selectors) {
+                const found = document.querySelectorAll(selector);
+                for (let i = 0; i < found.length; i += 1) {
+                  nodes.push(found[i]);
+                  if (nodes.length >= safeNodeLimit) {
+                    break outer;
+                  }
+                }
+                if (timedOut()) {
+                  break outer;
+                }
+              }
+              if (!nodes.length && document.body) {
+                nodes.push(document.body);
+              }
+              const matches = [];
+              const maxTextLength = Math.max(500, Number(nodeTextLimit) || 0);
+
+              for (const node of nodes) {
+                if (timedOut()) {
+                  break;
+                }
+                const raw = node.textContent || "";
+                if (!raw) continue;
+                const limited =
+                  raw.length > maxTextLength ? raw.slice(0, maxTextLength) : raw;
+                const text = clean(limited);
+                if (!text || !labelRegex.test(text)) continue;
+
+                const snippet = buildKeywordSnippet(text);
+                let value = extractValue(text);
+                if (!value && node.querySelector("strong")) {
+                  value = clean(node.querySelector("strong").textContent || "");
+                }
+                if (!value && node.nextElementSibling) {
+                  value = clean(node.nextElementSibling.textContent || "");
+                }
+                if (!value && node.parentElement) {
+                  value = clean(node.parentElement.textContent || "");
+                }
+
+                if (
+                  matchMode === "text" &&
+                  (!value || labelRegex.test(value)) &&
+                  snippet
+                ) {
+                  value = snippet;
+                }
+                if (!value) continue;
+
+                value = value.substring(0, 280);
+
+                const numberText =
+                  matchMode === "number"
+                    ? findNumber(`${text} ${value}`)
+                    : null;
+
+                matches.push({
+                  value,
+                  snippet: snippet || text.slice(0, 300),
+                  confidence: Math.min(
+                    98,
+                    62 +
+                      Math.min(value.split(" ").length, 7) * 4 +
+                      (numberText ? 10 : 0),
+                  ),
+                  numericValue: numberText
+                    ? parseFloat(numberText.replace(/,/g, "")) || null
+                    : null,
+                });
