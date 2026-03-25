@@ -6,7 +6,7 @@
   "main": "electron/main.js",
   "scripts": {
     "ng": "ng",
-    "start": "ng serve",
+    "start": "node main.js",
     "build": "ng build",
     "watch": "ng build --watch --configuration development",
     "test": "ng test",
