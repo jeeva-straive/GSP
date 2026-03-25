@@ -388,8 +388,14 @@ app.get("/search", async (req, res) => {
     options = {},
   ) {
     const browser = await puppeteer1.launch({
-      headless: false, // Set to false if you want to watch the process
-      args: ["--no-sandbox"],
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null, // Render needs this
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage", // Important for low-memory environments
+        "--single-process", // Helps save RAM on Render Free Tier
+      ],
+      headless: true, // Or true
       defaultViewport: null,
       protocolTimeout: 900000,
     });
@@ -657,117 +663,119 @@ app.get("/search", async (req, res) => {
                 const addrRegex =
                   /\d{1,5}\s[\w\s\.]{1,30}(?:Street|Telephone|Toll-Free|Fax|St|Avenue|Ave|Road|Rd|Blvd|Drive|Dr|Court|Ct|Way|Lane|Ln|Suite|Ste|Floor|Fl|Square|Plaza)\.?\s*[\w\s,]{1,50}\d{4,5}/gi;
                 const phoneRegex =
-                /(?:\+?1[-. ]?)?\(?([2-9][0-8][0-9])\)?[-. ]?([2-9][0-9]{2})[-. ]?([0-9]{4})/;
-              const STOP_LINE = /^(get directions|view map|directions|map)$/i;
+                  /(?:\+?1[-. ]?)?\(?([2-9][0-8][0-9])\)?[-. ]?([2-9][0-9]{2})[-. ]?([0-9]{4})/;
+                const STOP_LINE = /^(get directions|view map|directions|map)$/i;
 
-              const cleanBlock = (text = "") => {
-                return text
-                  .replace(/\r/g, "")
-                  .split("\n")
-                  .map((line) => line.replace(/\u00a0/g, " ").trim())
-                  .filter((line) => line && !STOP_LINE.test(line))
-                  .join("\n")
-                  .trim();
-              };
-
-              const dedupe = (list) => {
-                const seen = new Set();
-                const unique = [];
-                list.forEach((item) => {
-                  const normalized = item.replace(/\s+/g, " ").toLowerCase();
-                  if (!seen.has(normalized)) {
-                    seen.add(normalized);
-                    unique.push(item);
-                  }
-                });
-                return unique;
-              };
-
-              const hasAddress = (text) => {
-                if (!text) return false;
-                addrRegex.lastIndex = 0;
-                return addrRegex.test(text);
-              };
-
-              const captureStructuredSections = () => {
-                const sections = (document.body.innerText || "")
-                  .split(/\n\s*\n/g)
-                  .map((chunk) => cleanBlock(chunk))
-                  .filter(Boolean);
-                return dedupe(sections.filter((block) => hasAddress(block)));
-              };
-
-              const pageContent = cleanBlock(
-                (document.body && document.body.innerText) || "",
-              ).substring(0, 1200);
-
-              // 1. Capture entire sections/cards that contain address blocks
-              const sectionMatches = captureStructuredSections();
-              if (sectionMatches.length) {
-                return {
-                  addresses: sectionMatches,
-                  method: "Section Capture",
-                  pageContent,
-                };
-              }
-
-              // 2. Fall back to plain regex matches found anywhere on the page
-              const bodyText = document.body.innerText || "";
-              addrRegex.lastIndex = 0;
-              const addressMatch = bodyText.match(addrRegex) || [];
-              const cleanedMatches = dedupe(
-                addressMatch.map((match) => cleanBlock(match)).filter(Boolean),
-              );
-
-              if (cleanedMatches.length) {
-                return {
-                  addresses: cleanedMatches,
-                  method: "Standard Regex",
-                  pageContent,
-                };
-              }
-
-              // 3. Phone Number Anchor Logic (Fallback)
-              const elements = Array.from(
-                document.querySelectorAll("div, p, span, li, address"),
-              );
-              const fallbackAddresses = [];
-              for (let el of elements) {
-                const text = (el.innerText || "").trim();
-                if (!text) continue;
-                if (!phoneRegex.test(text)) continue;
-
-                const candidateContainer =
-                  el.closest(
-                    "address, article, section, li, [class*='location'], [class*='office'], [class*='contact'], [class*='branch'], [class*='card']",
-                  ) || el.parentElement;
-
-                const parentText = candidateContainer
-                  ? candidateContainer.innerText
-                  : el.innerText;
-
-                if (
-                  /\d+/.test(parentText) &&
-                  (/\d{5}/.test(parentText) ||
-                    /St|Ave|Rd|Drive|Suite|Box/i.test(parentText))
-                ) {
-                  const snippet = cleanBlock(parentText)
-                    .substring(0, 600)
+                const cleanBlock = (text = "") => {
+                  return text
+                    .replace(/\r/g, "")
+                    .split("\n")
+                    .map((line) => line.replace(/\u00a0/g, " ").trim())
+                    .filter((line) => line && !STOP_LINE.test(line))
+                    .join("\n")
                     .trim();
-                  if (snippet) {
-                    fallbackAddresses.push(snippet);
+                };
+
+                const dedupe = (list) => {
+                  const seen = new Set();
+                  const unique = [];
+                  list.forEach((item) => {
+                    const normalized = item.replace(/\s+/g, " ").toLowerCase();
+                    if (!seen.has(normalized)) {
+                      seen.add(normalized);
+                      unique.push(item);
+                    }
+                  });
+                  return unique;
+                };
+
+                const hasAddress = (text) => {
+                  if (!text) return false;
+                  addrRegex.lastIndex = 0;
+                  return addrRegex.test(text);
+                };
+
+                const captureStructuredSections = () => {
+                  const sections = (document.body.innerText || "")
+                    .split(/\n\s*\n/g)
+                    .map((chunk) => cleanBlock(chunk))
+                    .filter(Boolean);
+                  return dedupe(sections.filter((block) => hasAddress(block)));
+                };
+
+                const pageContent = cleanBlock(
+                  (document.body && document.body.innerText) || "",
+                ).substring(0, 1200);
+
+                // 1. Capture entire sections/cards that contain address blocks
+                const sectionMatches = captureStructuredSections();
+                if (sectionMatches.length) {
+                  return {
+                    addresses: sectionMatches,
+                    method: "Section Capture",
+                    pageContent,
+                  };
+                }
+
+                // 2. Fall back to plain regex matches found anywhere on the page
+                const bodyText = document.body.innerText || "";
+                addrRegex.lastIndex = 0;
+                const addressMatch = bodyText.match(addrRegex) || [];
+                const cleanedMatches = dedupe(
+                  addressMatch
+                    .map((match) => cleanBlock(match))
+                    .filter(Boolean),
+                );
+
+                if (cleanedMatches.length) {
+                  return {
+                    addresses: cleanedMatches,
+                    method: "Standard Regex",
+                    pageContent,
+                  };
+                }
+
+                // 3. Phone Number Anchor Logic (Fallback)
+                const elements = Array.from(
+                  document.querySelectorAll("div, p, span, li, address"),
+                );
+                const fallbackAddresses = [];
+                for (let el of elements) {
+                  const text = (el.innerText || "").trim();
+                  if (!text) continue;
+                  if (!phoneRegex.test(text)) continue;
+
+                  const candidateContainer =
+                    el.closest(
+                      "address, article, section, li, [class*='location'], [class*='office'], [class*='contact'], [class*='branch'], [class*='card']",
+                    ) || el.parentElement;
+
+                  const parentText = candidateContainer
+                    ? candidateContainer.innerText
+                    : el.innerText;
+
+                  if (
+                    /\d+/.test(parentText) &&
+                    (/\d{5}/.test(parentText) ||
+                      /St|Ave|Rd|Drive|Suite|Box/i.test(parentText))
+                  ) {
+                    const snippet = cleanBlock(parentText)
+                      .substring(0, 600)
+                      .trim();
+                    if (snippet) {
+                      fallbackAddresses.push(snippet);
+                    }
                   }
                 }
-              }
 
-              const cleanedFallback = dedupe(fallbackAddresses);
-              if (cleanedFallback.length) {
-                return {
-                  addresses: cleanedFallback,
-                  method: "Phone Anchor Proximity",
-                  pageContent,
-                };
-              }
+                const cleanedFallback = dedupe(fallbackAddresses);
+                if (cleanedFallback.length) {
+                  return {
+                    addresses: cleanedFallback,
+                    method: "Phone Anchor Proximity",
+                    pageContent,
+                  };
+                }
 
                 return { addresses: [], method: "Failed", pageContent };
               }),
@@ -820,214 +828,218 @@ app.get("/search", async (req, res) => {
                   scanTimeoutMs,
                   nodeTextLimit,
                 }) => {
-                const clean = (value = "") => value.replace(/\s+/g, " ").trim();
-                const escapeRegex = (value = "") =>
-                  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-                const normalized = (keyword || "").trim();
-                if (!normalized) return [];
-                const hasPerf =
-                  typeof performance !== "undefined" &&
-                  typeof performance.now === "function";
-                const now = () => (hasPerf ? performance.now() : Date.now());
-                const timeoutMs =
-                  typeof scanTimeoutMs === "number" && scanTimeoutMs > 0
-                    ? scanTimeoutMs
-                    : Number.POSITIVE_INFINITY;
-                const deadline = now() + timeoutMs;
-                const timedOut = () => now() >= deadline;
-                const pause = () =>
-                  new Promise((resolve) => requestAnimationFrame(resolve));
+                  const clean = (value = "") =>
+                    value.replace(/\s+/g, " ").trim();
+                  const escapeRegex = (value = "") =>
+                    value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                  const normalized = (keyword || "").trim();
+                  if (!normalized) return [];
+                  const hasPerf =
+                    typeof performance !== "undefined" &&
+                    typeof performance.now === "function";
+                  const now = () => (hasPerf ? performance.now() : Date.now());
+                  const timeoutMs =
+                    typeof scanTimeoutMs === "number" && scanTimeoutMs > 0
+                      ? scanTimeoutMs
+                      : Number.POSITIVE_INFINITY;
+                  const deadline = now() + timeoutMs;
+                  const timedOut = () => now() >= deadline;
+                  const pause = () =>
+                    new Promise((resolve) => requestAnimationFrame(resolve));
 
-                const lower = normalized.toLowerCase();
-                const providedSynonyms = Array.isArray(synonyms)
-                  ? synonyms.filter(Boolean)
-                  : [];
-                const labels = providedSynonyms.length
-                  ? providedSynonyms
-                  : [normalized, lower];
+                  const lower = normalized.toLowerCase();
+                  const providedSynonyms = Array.isArray(synonyms)
+                    ? synonyms.filter(Boolean)
+                    : [];
+                  const labels = providedSynonyms.length
+                    ? providedSynonyms
+                    : [normalized, lower];
 
-                const labelRegex = new RegExp(
-                  labels
-                    .map((label) => escapeRegex(label.toLowerCase()))
-                    .join("|"),
-                  "i",
-                );
-
-                const selectors = [
-                  "article",
-                  "section",
-                  "li",
-                  "div",
-                  "tr",
-                  "p",
-                  "h1",
-                  "h2",
-                  "h3",
-                  "h4",
-                  "h5",
-                  "h6",
-                  "dt",
-                  "dd",
-                  "span",
-                ];
-                const selectorString = selectors.join(",");
-                const chunkSize =
-                  typeof nodeLimit === "number" && nodeLimit > 0
-                    ? nodeLimit
-                    : Number.POSITIVE_INFINITY;
-                const chunkingEnabled =
-                  Number.isFinite(chunkSize) && chunkSize > 0;
-                const maxTextLength =
-                  typeof nodeTextLimit === "number" && nodeTextLimit > 0
-                    ? nodeTextLimit
-                    : Number.POSITIVE_INFINITY;
-                const matches = [];
-                const seenValues = new Set();
-                const buildSnippet = (text = "") => {
-                  if (!text) return "";
-                  const snippetRegex = new RegExp(
-                    labelRegex.source,
-                    labelRegex.flags,
+                  const labelRegex = new RegExp(
+                    labels
+                      .map((label) => escapeRegex(label.toLowerCase()))
+                      .join("|"),
+                    "i",
                   );
-                  const match = snippetRegex.exec(text);
-                  if (!match || typeof match.index !== "number") {
-                    return text.slice(0, 400).trim();
-                  }
-                  const window = 200;
-                  const start = Math.max(match.index - window, 0);
-                  const end = Math.min(
-                    match.index + match[0].length + window,
-                    text.length,
-                  );
-                  return text.slice(start, end).trim();
-                };
 
-                const processNode = (node) => {
-                  if (!node || node.nodeType !== 1) {
-                    return false;
-                  }
-                  const raw = node.textContent || "";
-                  if (!raw) return false;
-                  const limited =
-                    raw.length > maxTextLength
-                      ? raw.slice(0, maxTextLength)
-                      : raw;
-                  const normalizedText = clean(limited);
-                  if (!normalizedText || !labelRegex.test(normalizedText)) {
-                    return false;
-                  }
+                  const selectors = [
+                    "article",
+                    "section",
+                    "li",
+                    "div",
+                    "tr",
+                    "p",
+                    "h1",
+                    "h2",
+                    "h3",
+                    "h4",
+                    "h5",
+                    "h6",
+                    "dt",
+                    "dd",
+                    "span",
+                  ];
+                  const selectorString = selectors.join(",");
+                  const chunkSize =
+                    typeof nodeLimit === "number" && nodeLimit > 0
+                      ? nodeLimit
+                      : Number.POSITIVE_INFINITY;
+                  const chunkingEnabled =
+                    Number.isFinite(chunkSize) && chunkSize > 0;
+                  const maxTextLength =
+                    typeof nodeTextLimit === "number" && nodeTextLimit > 0
+                      ? nodeTextLimit
+                      : Number.POSITIVE_INFINITY;
+                  const matches = [];
+                  const seenValues = new Set();
+                  const buildSnippet = (text = "") => {
+                    if (!text) return "";
+                    const snippetRegex = new RegExp(
+                      labelRegex.source,
+                      labelRegex.flags,
+                    );
+                    const match = snippetRegex.exec(text);
+                    if (!match || typeof match.index !== "number") {
+                      return text.slice(0, 400).trim();
+                    }
+                    const window = 200;
+                    const start = Math.max(match.index - window, 0);
+                    const end = Math.min(
+                      match.index + match[0].length + window,
+                      text.length,
+                    );
+                    return text.slice(start, end).trim();
+                  };
 
-                  const snippet = buildSnippet(normalizedText);
-                  if (!snippet) {
-                    return false;
-                  }
+                  const processNode = (node) => {
+                    if (!node || node.nodeType !== 1) {
+                      return false;
+                    }
+                    const raw = node.textContent || "";
+                    if (!raw) return false;
+                    const limited =
+                      raw.length > maxTextLength
+                        ? raw.slice(0, maxTextLength)
+                        : raw;
+                    const normalizedText = clean(limited);
+                    if (!normalizedText || !labelRegex.test(normalizedText)) {
+                      return false;
+                    }
 
-                  if (seenValues.has(snippet)) {
-                    return false;
-                  }
-                  seenValues.add(snippet);
+                    const snippet = buildSnippet(normalizedText);
+                    if (!snippet) {
+                      return false;
+                    }
 
-                  matches.push({
-                    value: snippet,
-                    snippet,
-                    confidence: 100,
-                    numericValue: null,
-                  });
+                    if (seenValues.has(snippet)) {
+                      return false;
+                    }
+                    seenValues.add(snippet);
 
-                  return (
-                    typeof perPageMatchLimit === "number" &&
-                    perPageMatchLimit > 0 &&
-                    matches.length >= perPageMatchLimit
-                  );
-                };
+                    matches.push({
+                      value: snippet,
+                      snippet,
+                      confidence: 100,
+                      numericValue: null,
+                    });
 
-                const shouldStop = () =>
-                  timedOut() ||
-                  (typeof perPageMatchLimit === "number" &&
-                    perPageMatchLimit > 0 &&
-                    matches.length >= perPageMatchLimit);
+                    return (
+                      typeof perPageMatchLimit === "number" &&
+                      perPageMatchLimit > 0 &&
+                      matches.length >= perPageMatchLimit
+                    );
+                  };
 
-                const maybeScroll = async () => {
-                  if (timedOut()) return;
-                  const scroller =
-                    document.scrollingElement ||
-                    document.documentElement ||
-                    document.body;
-                  if (!scroller) {
-                    await pause();
-                    return;
-                  }
-                  const step = Math.max((window.innerHeight || 600) * 0.8, 400);
-                  const next =
-                    scroller.scrollTop + step >= scroller.scrollHeight
-                      ? scroller.scrollHeight
-                      : scroller.scrollTop + step;
-                  if (next !== scroller.scrollTop) {
-                    scroller.scrollTop = next;
-                    await pause();
-                  } else {
-                    await pause();
-                  }
-                };
+                  const shouldStop = () =>
+                    timedOut() ||
+                    (typeof perPageMatchLimit === "number" &&
+                      perPageMatchLimit > 0 &&
+                      matches.length >= perPageMatchLimit);
 
-                const root = document.body || document.documentElement;
-                let processed = 0;
-                if (
-                  root &&
-                  typeof document.createNodeIterator === "function" &&
-                  typeof NodeFilter !== "undefined"
-                ) {
-                  const iterator = document.createNodeIterator(
-                    root,
-                    NodeFilter.SHOW_ELEMENT,
-                    {
-                      acceptNode(node) {
-                        if (
-                          !node ||
-                          node.nodeType !== 1 ||
-                          typeof node.matches !== "function"
-                        ) {
-                          return NodeFilter.FILTER_SKIP;
-                        }
-                        return node.matches(selectorString)
-                          ? NodeFilter.FILTER_ACCEPT
-                          : NodeFilter.FILTER_SKIP;
+                  const maybeScroll = async () => {
+                    if (timedOut()) return;
+                    const scroller =
+                      document.scrollingElement ||
+                      document.documentElement ||
+                      document.body;
+                    if (!scroller) {
+                      await pause();
+                      return;
+                    }
+                    const step = Math.max(
+                      (window.innerHeight || 600) * 0.8,
+                      400,
+                    );
+                    const next =
+                      scroller.scrollTop + step >= scroller.scrollHeight
+                        ? scroller.scrollHeight
+                        : scroller.scrollTop + step;
+                    if (next !== scroller.scrollTop) {
+                      scroller.scrollTop = next;
+                      await pause();
+                    } else {
+                      await pause();
+                    }
+                  };
+
+                  const root = document.body || document.documentElement;
+                  let processed = 0;
+                  if (
+                    root &&
+                    typeof document.createNodeIterator === "function" &&
+                    typeof NodeFilter !== "undefined"
+                  ) {
+                    const iterator = document.createNodeIterator(
+                      root,
+                      NodeFilter.SHOW_ELEMENT,
+                      {
+                        acceptNode(node) {
+                          if (
+                            !node ||
+                            node.nodeType !== 1 ||
+                            typeof node.matches !== "function"
+                          ) {
+                            return NodeFilter.FILTER_SKIP;
+                          }
+                          return node.matches(selectorString)
+                            ? NodeFilter.FILTER_ACCEPT
+                            : NodeFilter.FILTER_SKIP;
+                        },
                       },
-                    },
-                  );
-                  let current;
-                  while (!shouldStop() && (current = iterator.nextNode())) {
-                    processed += 1;
-                    const shouldBreak = processNode(current);
-                    if (
-                      chunkingEnabled &&
-                      processed > 0 &&
-                      processed % chunkSize === 0
-                    ) {
-                      await maybeScroll();
+                    );
+                    let current;
+                    while (!shouldStop() && (current = iterator.nextNode())) {
+                      processed += 1;
+                      const shouldBreak = processNode(current);
+                      if (
+                        chunkingEnabled &&
+                        processed > 0 &&
+                        processed % chunkSize === 0
+                      ) {
+                        await maybeScroll();
+                      }
+                      if (shouldBreak || shouldStop()) {
+                        break;
+                      }
                     }
-                    if (shouldBreak || shouldStop()) {
-                      break;
+                  } else if (root) {
+                    const fallbackNodes = root.querySelectorAll(selectorString);
+                    for (let i = 0; i < fallbackNodes.length; i += 1) {
+                      if (shouldStop()) break;
+                      processed += 1;
+                      const shouldBreak = processNode(fallbackNodes[i]);
+                      if (
+                        chunkingEnabled &&
+                        processed > 0 &&
+                        processed % chunkSize === 0
+                      ) {
+                        await maybeScroll();
+                      }
+                      if (shouldBreak) {
+                        break;
+                      }
                     }
                   }
-                } else if (root) {
-                  const fallbackNodes = root.querySelectorAll(selectorString);
-                  for (let i = 0; i < fallbackNodes.length; i += 1) {
-                    if (shouldStop()) break;
-                    processed += 1;
-                    const shouldBreak = processNode(fallbackNodes[i]);
-                    if (
-                      chunkingEnabled &&
-                      processed > 0 &&
-                      processed % chunkSize === 0
-                    ) {
-                      await maybeScroll();
-                    }
-                    if (shouldBreak) {
-                      break;
-                    }
-                  }
-                }
 
                   return typeof perPageMatchLimit === "number" &&
                     perPageMatchLimit > 0
@@ -1071,46 +1083,49 @@ app.get("/search", async (req, res) => {
           prioritizedLinks = await runWithPage(() =>
             page.evaluate(
               ({ seedUrl, pattern, flags }) => {
-                const anchors = Array.from(document.querySelectorAll("a[href]"));
+                const anchors = Array.from(
+                  document.querySelectorAll("a[href]"),
+                );
                 const seen = new Set();
                 const collected = [];
-              let source = null;
-              const regex = new RegExp(pattern, flags);
-              try {
-                source = new URL(seedUrl);
-              } catch {
-                source = null;
-              }
-
-              for (const anchor of anchors) {
-                const href = anchor.getAttribute("href");
-                if (!href) continue;
-                let normalized;
+                let source = null;
+                const regex = new RegExp(pattern, flags);
                 try {
-                  normalized = new URL(href, seedUrl).href;
+                  source = new URL(seedUrl);
                 } catch {
-                  continue;
+                  source = null;
                 }
-                if (seen.has(normalized)) continue;
 
-                if (source) {
+                for (const anchor of anchors) {
+                  const href = anchor.getAttribute("href");
+                  if (!href) continue;
+                  let normalized;
                   try {
-                    if (new URL(normalized).origin !== source.origin) continue;
+                    normalized = new URL(href, seedUrl).href;
                   } catch {
                     continue;
                   }
-                }
+                  if (seen.has(normalized)) continue;
 
-                const text = (anchor.innerText || "").toLowerCase();
-                const hrefLower = normalized.toLowerCase();
-                if (!regex.test(text) && !regex.test(hrefLower)) {
-                  continue;
-                }
+                  if (source) {
+                    try {
+                      if (new URL(normalized).origin !== source.origin)
+                        continue;
+                    } catch {
+                      continue;
+                    }
+                  }
 
-                seen.add(normalized);
-                collected.push(normalized);
-                if (collected.length >= 20) break;
-              }
+                  const text = (anchor.innerText || "").toLowerCase();
+                  const hrefLower = normalized.toLowerCase();
+                  if (!regex.test(text) && !regex.test(hrefLower)) {
+                    continue;
+                  }
+
+                  seen.add(normalized);
+                  collected.push(normalized);
+                  if (collected.length >= 20) break;
+                }
                 return collected;
               },
               {
@@ -1141,43 +1156,45 @@ app.get("/search", async (req, res) => {
           discoveredLinks = await runWithPage(() =>
             page.evaluate(
               ({ seedUrl, limit }) => {
-                const anchors = Array.from(document.querySelectorAll("a[href]"));
+                const anchors = Array.from(
+                  document.querySelectorAll("a[href]"),
+                );
                 const seen = new Set();
                 const collected = [];
-              let source = null;
-              try {
-                source = new URL(seedUrl);
-              } catch {
-                source = null;
-              }
-              const hasLimit =
-                typeof limit === "number" &&
-                Number.isFinite(limit) &&
-                limit > 0;
-              for (const anchor of anchors) {
-                if (hasLimit && collected.length >= limit) break;
-                const rawHref = anchor.getAttribute("href") || "";
-                if (!rawHref || rawHref.startsWith("#")) continue;
-                if (/^(javascript:|mailto:|tel:)/i.test(rawHref)) continue;
-                let normalized;
+                let source = null;
                 try {
-                  normalized = new URL(rawHref, seedUrl).href;
+                  source = new URL(seedUrl);
                 } catch {
-                  continue;
+                  source = null;
                 }
-                if (seen.has(normalized)) continue;
-                if (source) {
+                const hasLimit =
+                  typeof limit === "number" &&
+                  Number.isFinite(limit) &&
+                  limit > 0;
+                for (const anchor of anchors) {
+                  if (hasLimit && collected.length >= limit) break;
+                  const rawHref = anchor.getAttribute("href") || "";
+                  if (!rawHref || rawHref.startsWith("#")) continue;
+                  if (/^(javascript:|mailto:|tel:)/i.test(rawHref)) continue;
+                  let normalized;
                   try {
-                    if (new URL(normalized).origin !== source.origin) {
-                      continue;
-                    }
+                    normalized = new URL(rawHref, seedUrl).href;
                   } catch {
                     continue;
                   }
+                  if (seen.has(normalized)) continue;
+                  if (source) {
+                    try {
+                      if (new URL(normalized).origin !== source.origin) {
+                        continue;
+                      }
+                    } catch {
+                      continue;
+                    }
+                  }
+                  seen.add(normalized);
+                  collected.push(normalized);
                 }
-                seen.add(normalized);
-                collected.push(normalized);
-              }
                 return collected;
               },
               { seedUrl: current, limit: linkCapPerPage },
@@ -1203,7 +1220,6 @@ app.get("/search", async (req, res) => {
           break;
         }
       }
-
     } catch (err) {
       if (err instanceof ManualAbortError) {
         manualAbortTriggered = true;
@@ -1242,8 +1258,7 @@ app.get("/search", async (req, res) => {
       results.partial = true;
       results.crawlStatus = "aborted";
       results.message =
-        results.message ||
-        "Browser window was closed before crawl completed.";
+        results.message || "Browser window was closed before crawl completed.";
       if (!results.contactPageUrl) {
         results.contactPageUrl = normalizedStart;
       }
