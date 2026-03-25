@@ -37,6 +37,10 @@ interface CompanyData {
   keywordMatches: KeywordMatch[];
   keywordHit: KeywordMatch | null;
   keywordSummaries?: KeywordSummary[];
+  jobId?: string;
+  partial?: boolean;
+  crawlStatus?: 'completed' | 'aborted' | 'stopped';
+  message?: string;
 }
 
 interface SearchResponse {
@@ -209,6 +213,14 @@ interface GoogleSearchResponse {
               {{ isGoogleSearching ? 'Google Searching...' : 'Google Search' }}
             </button>
             <button
+              class="btn btn-outline-danger"
+              type="button"
+              (click)="stopSearch()"
+              [disabled]="!isSearching || stopRequested || !currentJobId"
+            >
+              {{ stopRequested ? 'Stopping...' : 'Stop' }}
+            </button>
+            <button
               class="btn btn-outline-secondary"
               type="button"
               (click)="clear()"
@@ -236,8 +248,17 @@ interface GoogleSearchResponse {
         </div>
 
         <div *ngIf="!isSearching && result" class="mt-3">
+          <div
+            *ngIf="result.partial"
+            class="alert alert-warning"
+          >
+            {{ result.message || 'Crawl stopped before completion.' }}
+          </div>
           <h5 class="mb-2">Company Overview</h5>
           <div class="mb-2"><strong>Website:</strong> {{ result.website }}</div>
+          <div class="mb-2" *ngIf="result.jobId">
+            <strong>Job ID:</strong> {{ result.jobId }}
+          </div>
           <div class="mb-2">
             <strong>Company Name:</strong> {{ result.companyName || 'N/A' }}
           </div>
@@ -488,6 +509,8 @@ export class SearchComponent {
   isGoogleSearching = false;
   googleError: string | null = null;
   googleResultsLimit = 5;
+  currentJobId: string | null = null;
+  stopRequested = false;
 
   constructor(private http: HttpClient) {}
 
@@ -507,9 +530,13 @@ export class SearchComponent {
     this.keywordTabs = [];
     this.activeKeyword = null;
     this.isSearching = true;
+    this.stopRequested = false;
+    const jobId = this.generateJobId();
+    this.currentJobId = jobId;
     const params: Record<string, string> = { url: this.url };
     params['keywords'] = keywords.join(',');
     params['keyword'] = keywords[0];
+    params['jobId'] = jobId;
     if (
       this.maxDepth !== '' &&
       this.maxDepth !== null &&
@@ -521,12 +548,14 @@ export class SearchComponent {
       }
     }
     this.http
-      .get<SearchResponse>('https://gsp-coxk.onrender.com/search', {
+      .get<SearchResponse>('http://localhost:3000/search', {
         params,
       })
       .subscribe({
         next: (resp) => {
           this.isSearching = false;
+          this.stopRequested = false;
+          this.currentJobId = null;
           if (!resp.success || !resp.data) {
             this.error =
               resp.error || 'Unable to extract details for the provided URL.';
@@ -537,8 +566,34 @@ export class SearchComponent {
         },
         error: (err) => {
           this.isSearching = false;
+          this.stopRequested = false;
+          this.currentJobId = null;
           this.error =
             err?.message || 'Unexpected error while crawling the website.';
+        },
+      });
+  }
+
+  stopSearch() {
+    if (!this.isSearching || !this.currentJobId || this.stopRequested) {
+      return;
+    }
+    this.stopRequested = true;
+    this.http
+      .post<{ success: boolean; error?: string }>(
+        'http://localhost:3000/search/stop',
+        { jobId: this.currentJobId },
+      )
+      .subscribe({
+        error: (err) => {
+          this.stopRequested = false;
+          const message =
+            err?.error?.error ||
+            err?.message ||
+            'Unable to stop the current crawl.';
+          if (err?.status !== 404) {
+            this.error = message;
+          }
         },
       });
   }
@@ -548,6 +603,19 @@ export class SearchComponent {
       .split(/[\n,]+/)
       .map((value) => value.trim())
       .filter((value) => !!value);
+  }
+
+  private generateJobId(): string {
+    const hasCrypto =
+      typeof window !== 'undefined' &&
+      typeof window.crypto !== 'undefined' &&
+      typeof window.crypto.randomUUID === 'function';
+    if (hasCrypto) {
+      return window.crypto.randomUUID();
+    }
+    return `${Date.now().toString(36)}${Math.random()
+      .toString(36)
+      .slice(2, 10)}`;
   }
 
   runGoogleSearch() {
@@ -616,6 +684,8 @@ export class SearchComponent {
     this.googleError = null;
     this.isGoogleSearching = false;
     this.googleResultsLimit = 5;
+    this.currentJobId = null;
+    this.stopRequested = false;
   }
 
   toGoogleQueryLink(query: string) {

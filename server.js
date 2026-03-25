@@ -4,8 +4,8 @@ const http = require("http");
 const https = require("https");
 const { performance } = require("perf_hooks");
 const { BrowserWindow, BrowserView, ipcMain } = require("electron");
-// const path = require("path");
-// const fs = require("fs");
+const path = require("path");
+const fs = require("fs");
 const pie = require("puppeteer-in-electron");
 const puppeteer = require("puppeteer-core");
 const puppeteer1 = require("puppeteer");
@@ -14,6 +14,7 @@ const synonymsLib = require("synonyms");
 const app = express();
 // Store latest sibling results by session id for Angular to fetch
 const HoverSessions = new Map(); // sessionId -> { selector, currentHref, siblings, pageUrl }
+const activeSearchJobs = new Map(); // jobId -> { abortToken }
 
 const axios = require("axios");
 const { HttpsProxyAgent } = require("https-proxy-agent");
@@ -67,6 +68,105 @@ function mergeKeywords(...inputs) {
     }
   }
   return deduped;
+}
+
+function findSystemChromeExecutable() {
+  const candidates = [];
+  const pushCandidate = (value) => {
+    if (value && typeof value === "string") {
+      candidates.push(value);
+    }
+  };
+
+  pushCandidate(process.env.PUPPETEER_EXECUTABLE_PATH);
+  pushCandidate(process.env.CHROME_EXECUTABLE_PATH);
+  pushCandidate(process.env.CHROME_PATH);
+
+  if (process.platform === "win32") {
+    const programFiles = process.env.PROGRAMFILES || "C:\\Program Files";
+    const programFilesX86 =
+      process.env["PROGRAMFILES(X86)"] || "C:\\Program Files (x86)";
+    pushCandidate(
+      path.join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+    );
+    pushCandidate(
+      path.join(
+        programFilesX86,
+        "Google",
+        "Chrome",
+        "Application",
+        "chrome.exe",
+      ),
+    );
+  } else if (process.platform === "darwin") {
+    pushCandidate(
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    );
+    pushCandidate(
+      "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+    );
+  } else {
+    pushCandidate("/usr/bin/google-chrome");
+    pushCandidate("/usr/bin/google-chrome-stable");
+    pushCandidate("/usr/bin/chromium-browser");
+    pushCandidate("/usr/bin/chromium");
+  }
+
+  for (const candidate of candidates) {
+    try {
+      if (candidate && fs.existsSync(candidate)) {
+        return candidate;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function launchCrawlerBrowser() {
+  const baseOptions = {
+    headless: true,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--single-process",
+    ],
+    defaultViewport: null,
+    protocolTimeout: 900000,
+  };
+
+  const attemptConfigs = [];
+  const envExecutable = findSystemChromeExecutable();
+
+  if (envExecutable) {
+    attemptConfigs.push({ ...baseOptions, executablePath: envExecutable });
+  }
+
+  attemptConfigs.push({ ...baseOptions });
+  attemptConfigs.push({ ...baseOptions, channel: "chrome" });
+
+  const deduped = [];
+  const seen = new Set();
+  for (const config of attemptConfigs) {
+    const key = JSON.stringify({
+      channel: config.channel || "",
+      executablePath: config.executablePath || "",
+    });
+    if (seen.has(key)) continue;
+    seen.add(key);
+    deduped.push(config);
+  }
+
+  let lastError = null;
+  for (const config of deduped) {
+    try {
+      return await puppeteer1.launch(config);
+    } catch (err) {
+      lastError = err;
+      continue;
+    }
+  }
+  throw lastError;
 }
 
 function buildSynonymList(keyword) {
@@ -139,6 +239,20 @@ app.get("/search", async (req, res) => {
       error: "Provide at least one ?keyword= or ?keywords=",
     });
   }
+
+  const incomingJobId = (req.query.jobId || "").toString().trim();
+  const jobId =
+    incomingJobId ||
+    `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  if (activeSearchJobs.has(jobId)) {
+    return res.status(409).json({
+      success: false,
+      error:
+        "A crawl is already running for this job. Please wait for it to finish or use a new jobId.",
+    });
+  }
+  const abortToken = { aborted: false, reason: null };
+  activeSearchJobs.set(jobId, { abortToken, url: targetUrl, keywords });
   // async function scrapeCompanyData(targetUrl) {
   //   const browser = await puppeteer1.launch({
   //     channel: "chrome",
@@ -387,20 +501,16 @@ app.get("/search", async (req, res) => {
     requestedMaxDepth = null,
     options = {},
   ) {
-    const browser = await puppeteer1.launch({
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || null, // Render needs this
-      args: [
-        "--no-sandbox",
-        "--disable-setuid-sandbox",
-        "--disable-dev-shm-usage", // Important for low-memory environments
-        "--single-process", // Helps save RAM on Render Free Tier
-      ],
-      headless: true, // Or true
-      defaultViewport: null,
-      protocolTimeout: 900000,
-    });
+    const browser = await launchCrawlerBrowser();
     const page = await browser.newPage();
     await page.setUserAgent(DEFAULT_SCRAPER_UA);
+
+    const abortToken =
+      options && typeof options === "object" ? options.abortToken : null;
+    const crawlJobId =
+      options && typeof options.jobId !== "undefined"
+        ? String(options.jobId)
+        : null;
 
     class ManualAbortError extends Error {
       constructor() {
@@ -419,6 +529,9 @@ app.get("/search", async (req, res) => {
     page.on("crash", markAbort);
     browser.on("disconnected", markAbort);
 
+    const isExternalAbortRequested = () =>
+      !!(abortToken && abortToken.aborted === true);
+
     const isManualCloseError = (err) => {
       if (!err || !err.message) return abortedByUser || page.isClosed();
       const msg = err.message.toLowerCase();
@@ -432,14 +545,17 @@ app.get("/search", async (req, res) => {
       );
     };
 
+    const isAbortRequested = () =>
+      abortedByUser || page.isClosed() || isExternalAbortRequested();
+
     const runWithPage = async (task) => {
-      if (abortedByUser || page.isClosed()) {
+      if (isAbortRequested()) {
         throw new ManualAbortError();
       }
       try {
         return await task();
       } catch (err) {
-        if (isManualCloseError(err)) {
+        if (isManualCloseError(err) || isExternalAbortRequested()) {
           markAbort();
           throw new ManualAbortError();
         }
@@ -473,6 +589,10 @@ app.get("/search", async (req, res) => {
       keywordMatches: [],
       keywordHit: null,
       keywordSummaries: [],
+      jobId: crawlJobId || undefined,
+      partial: false,
+      crawlStatus: "running",
+      message: "",
     };
 
     const linkCapPerPage = null;
@@ -513,6 +633,9 @@ app.get("/search", async (req, res) => {
 
     try {
       while (queue.length) {
+        if (isAbortRequested()) {
+          throw new ManualAbortError();
+        }
         // if (matchLimit !== null && areAllKeywordLimitsSatisfied()) {
         //   break;
         // }
@@ -538,7 +661,7 @@ app.get("/search", async (req, res) => {
             }),
           );
           await pause(5000); // pause to let dynamic content render before evaluation
-          if (abortedByUser || page.isClosed()) {
+          if (isAbortRequested()) {
             throw new ManualAbortError();
           }
         } catch (navErr) {
@@ -1254,17 +1377,23 @@ app.get("/search", async (req, res) => {
     results.keywordMatches = primarySummary.keywordMatches;
     results.keywordHit = primarySummary.keywordHit;
 
-    if (abortedByUser || manualAbortTriggered) {
+    const externalStop = isExternalAbortRequested();
+    if (abortedByUser || manualAbortTriggered || externalStop) {
       results.partial = true;
-      results.crawlStatus = "aborted";
+      results.crawlStatus = externalStop ? "stopped" : "aborted";
       results.message =
-        results.message || "Browser window was closed before crawl completed.";
+        (abortToken && abortToken.reason) ||
+        results.message ||
+        (externalStop
+          ? "Crawl was stopped before completion."
+          : "Browser window was closed before crawl completed.");
       if (!results.contactPageUrl) {
         results.contactPageUrl = normalizedStart;
       }
     } else {
       results.partial = false;
       results.crawlStatus = "completed";
+      results.message = results.message || "";
     }
 
     return results;
@@ -1367,7 +1496,12 @@ app.get("/search", async (req, res) => {
     const data = await scrapeFullCompanyData(targetUrl, keywords, maxDepth, {
       fullCrawl,
       maxResults,
+      abortToken,
+      jobId,
     }); // Note: using actual CSO domain
+    if (data && typeof data === "object") {
+      data.jobId = jobId;
+    }
     console.log("\n--- Extraction Complete ---");
     console.log(JSON.stringify(data, null, 2));
     return res.json({ success: true, data });
@@ -1378,8 +1512,34 @@ app.get("/search", async (req, res) => {
       error:
         (err && err.message) ||
         "Unable to extract company data for the requested URL.",
+      jobId,
+    });
+  } finally {
+    activeSearchJobs.delete(jobId);
+  }
+});
+
+app.post("/search/stop", (req, res) => {
+  const jobId = (
+    req.body && req.body.jobId ? String(req.body.jobId) : ""
+  ).trim();
+  if (!jobId) {
+    return res
+      .status(400)
+      .json({ success: false, error: "Provide jobId in the request body." });
+  }
+  const entry = activeSearchJobs.get(jobId);
+  if (!entry || !entry.abortToken) {
+    return res.status(404).json({
+      success: false,
+      error: "No active crawl found for the provided jobId.",
     });
   }
+  entry.abortToken.aborted = true;
+  if (!entry.abortToken.reason) {
+    entry.abortToken.reason = "Crawl stopped by user request.";
+  }
+  return res.json({ success: true, message: "Stop signal sent.", jobId });
 });
 
 // ---------- Utilities ----------
@@ -1704,8 +1864,6 @@ app.post("/detect-content", async (req, res) => {
 });
 
 // ---------- Scraping Jobs API ----------
-const path = require("path");
-const fs = require("fs");
 const { runJob } = require("./electron/scraper/engine");
 
 const Runs = new Map(); // runId -> { status, startedAt, finishedAt, rows, error }
