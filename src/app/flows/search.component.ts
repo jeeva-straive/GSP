@@ -248,10 +248,7 @@ interface GoogleSearchResponse {
         </div>
 
         <div *ngIf="!isSearching && result" class="mt-3">
-          <div
-            *ngIf="result.partial"
-            class="alert alert-warning"
-          >
+          <div *ngIf="result.partial" class="alert alert-warning">
             {{ result.message || 'Crawl stopped before completion.' }}
           </div>
           <h5 class="mb-2">Company Overview</h5>
@@ -548,7 +545,7 @@ export class SearchComponent {
       }
     }
     this.http
-      .get<SearchResponse>('http://localhost:3000/search', {
+      .get<SearchResponse>('https://gsp-coxk.onrender.com/search', {
         params,
       })
       .subscribe({
@@ -580,10 +577,10 @@ export class SearchComponent {
     }
     this.stopRequested = true;
     this.http
-      .post<{ success: boolean; error?: string }>(
-        'http://localhost:3000/search/stop',
-        { jobId: this.currentJobId },
-      )
+      .post<{
+        success: boolean;
+        error?: string;
+      }>('https://gsp-coxk.onrender.com/search/stop', { jobId: this.currentJobId })
       .subscribe({
         error: (err) => {
           this.stopRequested = false;

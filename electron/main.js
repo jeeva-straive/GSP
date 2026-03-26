@@ -160,13 +160,13 @@ function createWindow() {
   } else {
     // Production: load built Angular index.html from dist
     const indexHtmlCandidates = [
-      path.join(__dirname, "..", "dist", "angular-hello-world", "index.html"),
+      path.join(__dirname, "..", "dist", "gsp", "index.html"),
       // In some pack configs, resources/app is the base. __dirname inside asar should still resolve, but keep a fallback:
       path.join(
         process.resourcesPath || "",
         "app",
         "dist",
-        "angular-hello-world",
+        "gsp",
         "index.html",
       ),
     ];
@@ -182,7 +182,7 @@ function createWindow() {
         .loadFile(indexPath)
         .catch((e) => console.error("Failed to load file", indexPath, e));
     } else {
-      console.error("index.html not found in dist/angular-hello-world");
+      console.error("index.html not found in dist/gsp");
     }
   }
 }
@@ -343,13 +343,7 @@ ipcMain.handle("pie:home", async () => {
       const devUrl = "http://localhost:4200";
       await mainWindow.loadURL(devUrl);
     } else {
-      const indexPath = path.join(
-        __dirname,
-        "..",
-        "dist",
-        "angular-hello-world",
-        "index.html",
-      );
+      const indexPath = path.join(__dirname, "..", "dist", "gsp", "index.html");
       await mainWindow.loadFile(indexPath);
     }
     return true;

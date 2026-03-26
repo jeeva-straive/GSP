@@ -23,6 +23,16 @@ app.use(express.json());
 const cors = require("cors");
 app.use(cors());
 
+// 1. Serve static files from the Angular build directory
+// Note: Replace 'your-app-name' with the actual folder name generated inside your 'dist' folder
+app.use(express.static(path.join(__dirname, "dist/gsp")));
+
+// 2. Catch-all route to pass routing over to Angular's frontend router
+// This MUST go after your API routes!
+app.get("*", (req, res) => {
+  res.sendFile(path.join(__dirname, "dist/gsp/index.html"));
+});
+
 function isValidUrl(url) {
   try {
     new URL(url);
