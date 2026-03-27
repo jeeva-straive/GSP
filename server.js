@@ -1,4 +1,4 @@
-const express = require("express");
+﻿const express = require("express");
 const { chromium } = require("playwright");
 const http = require("http");
 const https = require("https");
@@ -14,7 +14,7 @@ const synonymsLib = require("synonyms");
 const app = express();
 // Store latest sibling results by session id for Angular to fetch
 const HoverSessions = new Map(); // sessionId -> { selector, currentHref, siblings, pageUrl }
-const activeSearchJobs = new Map(); // jobId -> { abortToken }
+const activeSearchJobs = new Map(); // jobId -> { abortToken, status, lastResult, ... }
 
 const axios = require("axios");
 const { HttpsProxyAgent } = require("https-proxy-agent");
@@ -78,6 +78,87 @@ function mergeKeywords(...inputs) {
     }
   }
   return deduped;
+}
+
+const MANUAL_KEYWORD_SYNONYMS = {
+  revenue: [
+    "sales",
+    "turnover",
+    "top line",
+    "total revenue",
+    "annual revenue",
+    "gross revenue",
+    "income",
+    "revenue",
+  ],
+  employees: [
+    "employee count",
+    "staff",
+    "headcount",
+    "team members",
+    "personnel",
+    "associates",
+    "employees",
+    "developers",
+  ],
+  ceo: [
+    "chief executive officer",
+    "chief executive",
+    "ceo & founder",
+    "Chairman of the board",
+  ],
+  founder: ["co-founder", "founder & ceo", "founding team"],
+};
+
+const JOB_RETENTION_MS = 5 * 60 * 1000;
+const JOB_SNAPSHOT_THROTTLE_MS = 1200;
+
+function registerSearchJob(jobId, url, keywords, abortToken) {
+  const entry = {
+    jobId,
+    url,
+    keywords,
+    abortToken,
+    status: "running",
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    finishedAt: null,
+    lastResult: null,
+    error: null,
+  };
+  activeSearchJobs.set(jobId, entry);
+  return entry;
+}
+
+function updateSearchJob(jobId, snapshot, options = {}) {
+  const entry = activeSearchJobs.get(jobId);
+  if (!entry) return null;
+  if (snapshot) {
+    entry.lastResult = {
+      ...snapshot,
+      jobId: snapshot.jobId || entry.jobId,
+    };
+  }
+  if (options.status) {
+    entry.status = options.status;
+  }
+  if (Object.prototype.hasOwnProperty.call(options, "error")) {
+    entry.error = options.error;
+  }
+  entry.updatedAt = Date.now();
+  if (options.final) {
+    entry.finishedAt = entry.updatedAt;
+  }
+  return entry;
+}
+
+function cleanupFinishedJobs() {
+  const cutoff = Date.now() - JOB_RETENTION_MS;
+  for (const [jobId, entry] of activeSearchJobs.entries()) {
+    if (entry && entry.finishedAt && entry.finishedAt < cutoff) {
+      activeSearchJobs.delete(jobId);
+    }
+  }
 }
 
 function findSystemChromeExecutable() {
@@ -194,6 +275,14 @@ function buildSynonymList(keyword) {
     set.add(noPunct.toLowerCase());
   }
   const base = normalized.toLowerCase();
+  const manual = MANUAL_KEYWORD_SYNONYMS[base];
+  if (Array.isArray(manual)) {
+    manual.forEach((entry) => {
+      if (!entry) return;
+      set.add(entry);
+      set.add(entry.toLowerCase());
+    });
+  }
   try {
     const libSynonyms = synonymsLib(base, "n");
     if (Array.isArray(libSynonyms)) {
@@ -217,7 +306,175 @@ function buildSynonymList(keyword) {
   return Array.from(set).filter(Boolean);
 }
 
+app.get("/search/cache", (req, res) => {
+  const targetUrl = req.query.url;
+  const keywords = mergeKeywords(req.query.keywords, req.query.keyword);
+  if (!targetUrl || !isValidUrl(targetUrl)) {
+    return res
+      .status(400)
+      .json({ success: false, error: "Provide a valid ?url=" });
+  }
+  if (!keywords.length) {
+    return res.status(400).json({
+      success: false,
+      error: "Provide at least one ?keyword= or ?keywords=",
+    });
+  }
+  return res.json({
+    success: false,
+    cacheHit: false,
+    error: "No cached crawl available for the provided inputs.",
+  });
+});
+
+app.get("/search/start", (req, res) => {
+  cleanupFinishedJobs();
+  const targetUrl = req.query.url;
+  const keywords = mergeKeywords(req.query.keywords, req.query.keyword);
+  const rawDepth = req.query.maxDepth;
+  const fullCrawl = true;
+  const maxResults = null;
+  let maxDepth = null;
+  if (typeof rawDepth !== "undefined" && rawDepth !== null) {
+    const depthValue = Array.isArray(rawDepth) ? rawDepth[0] : rawDepth;
+    const parsed = Number.parseInt(depthValue, 10);
+    if (!Number.isNaN(parsed) && parsed >= 0) {
+      maxDepth = parsed;
+    }
+  }
+
+  if (!targetUrl || !isValidUrl(targetUrl)) {
+    return res
+      .status(400)
+      .json({ success: false, error: "Provide a valid ?url=" });
+  }
+  if (!keywords.length) {
+    return res.status(400).json({
+      success: false,
+      error: "Provide at least one ?keyword= or ?keywords=",
+    });
+  }
+
+  const incomingJobId = (req.query.jobId || "").toString().trim();
+  const jobId =
+    incomingJobId ||
+    `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+
+  const existing = activeSearchJobs.get(jobId);
+  if (existing && existing.status === "running") {
+    return res.status(409).json({
+      success: false,
+      error:
+        "A crawl is already running for this job. Please wait for it to finish or use a new jobId.",
+    });
+  }
+
+  const abortToken = { aborted: false, reason: null };
+  registerSearchJob(jobId, targetUrl, keywords, abortToken);
+  updateSearchJob(
+    jobId,
+    {
+      website: targetUrl,
+      keywords,
+      partial: true,
+      crawlStatus: "running",
+      message: "Preparing crawl...",
+    },
+    { status: "running" },
+  );
+
+  const runner = async () => {
+    try {
+      const data = await scrapeFullCompanyData(targetUrl, keywords, maxDepth, {
+        fullCrawl,
+        maxResults,
+        abortToken,
+        jobId,
+      });
+      const finalStatus = abortToken.aborted ? "aborted" : "completed";
+      const payload = {
+        ...(data || {}),
+        jobId,
+        crawlStatus: finalStatus,
+        partial: finalStatus !== "completed",
+        message:
+          finalStatus === "completed"
+            ? "Crawl completed successfully."
+            : abortToken.reason || "Crawl aborted.",
+      };
+      updateSearchJob(jobId, payload, {
+        status: finalStatus,
+        error: finalStatus === "completed" ? null : abortToken.reason || null,
+        final: true,
+      });
+    } catch (err) {
+      const aborted = abortToken.aborted;
+      const finalStatus = aborted ? "aborted" : "failed";
+      const message =
+        (err && err.message) ||
+        "Unable to extract company data for the requested URL.";
+      const fallback = (activeSearchJobs.get(jobId) &&
+        activeSearchJobs.get(jobId).lastResult) || {
+        website: targetUrl,
+        keywords,
+        partial: true,
+      };
+      fallback.crawlStatus = finalStatus;
+      fallback.partial = true;
+      fallback.message = message;
+      fallback.jobId = jobId;
+      updateSearchJob(jobId, fallback, {
+        status: finalStatus,
+        error: message,
+        final: true,
+      });
+    }
+  };
+  setImmediate(runner);
+
+  return res.json({
+    success: true,
+    jobId,
+    message:
+      "Crawl started. Poll /search/status?jobId=... to receive incremental updates.",
+  });
+});
+
+app.get("/search/status", (req, res) => {
+  cleanupFinishedJobs();
+  const jobId = (req.query.jobId || "").toString().trim();
+  if (!jobId) {
+    return res
+      .status(400)
+      .json({ success: false, error: "Provide ?jobId in the query string." });
+  }
+  const entry = activeSearchJobs.get(jobId);
+  if (!entry) {
+    return res.status(404).json({
+      success: false,
+      error: "No crawl found for the provided jobId.",
+      jobId,
+    });
+  }
+  const status = entry.status || "running";
+  const payload = entry.lastResult ? { ...entry.lastResult } : null;
+  if (payload && !payload.jobId) {
+    payload.jobId = jobId;
+  }
+  return res.json({
+    success: true,
+    jobId,
+    data: payload,
+    status,
+    completed: status === "completed",
+    failed: status === "failed",
+    error: entry.error || null,
+    updatedAt: entry.updatedAt || entry.createdAt,
+  });
+});
+
 app.get("/search", async (req, res) => {
+  cleanupFinishedJobs();
   const targetUrl = req.query.url;
   const keywords = mergeKeywords(req.query.keywords, req.query.keyword);
   const rawDepth = req.query.maxDepth;
@@ -262,7 +519,7 @@ app.get("/search", async (req, res) => {
     });
   }
   const abortToken = { aborted: false, reason: null };
-  activeSearchJobs.set(jobId, { abortToken, url: targetUrl, keywords });
+  registerSearchJob(jobId, targetUrl, keywords, abortToken);
   // async function scrapeCompanyData(targetUrl) {
   //   const browser = await puppeteer1.launch({
   //     channel: "chrome",
@@ -471,1037 +728,6 @@ app.get("/search", async (req, res) => {
   //   return results;
   // }
 
-  const PRIORITY_LINK_REGEX =
-    /(contact|about|team|leadership|management|people|executive|board|company|who-we-are|our-story)/i;
-  const DEFAULT_SCRAPER_UA =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
-  // const MAX_KEYWORD_MATCHES = 10;
-  // const MAX_PAGES_SMART = 30;
-  // const MAX_PAGES_FULL = 120;
-  // const MAX_PDF_LINK_SCANS_PER_PAGE = 3;
-  // const MAX_PDF_LINK_SCANS_TOTAL = 12;
-  // const MAX_PDF_BYTES = 7 * 1024 * 1024; // 7 MB safety cap
-  // const PDF_FETCH_TIMEOUT_MS = 20000;
-  // const PDF_BROWSER_TIMEOUT_MS = 25000;
-  // const PDF_SNIPPET_RADIUS = 180;
-
-  function normalizeUrl(href, base) {
-    if (!href) return null;
-    const trimmed = String(href).trim();
-    if (!trimmed || trimmed.startsWith("#")) return null;
-    if (/^(javascript:|mailto:|tel:)/i.test(trimmed)) return null;
-    try {
-      const url = base ? new URL(trimmed, base) : new URL(trimmed);
-      url.hash = "";
-      let result = url.href;
-      if (result.length > url.origin.length + 1 && result.endsWith("/")) {
-        result = result.replace(/\/+$/, "");
-      }
-      return result;
-    } catch {
-      return null;
-    }
-  }
-
-  const pause = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
-
-  async function scrapeFullCompanyData(
-    url,
-    keywords,
-    requestedMaxDepth = null,
-    options = {},
-  ) {
-    const browser = await launchCrawlerBrowser();
-    const page = await browser.newPage();
-    await page.setUserAgent(DEFAULT_SCRAPER_UA);
-
-    const abortToken =
-      options && typeof options === "object" ? options.abortToken : null;
-    const crawlJobId =
-      options && typeof options.jobId !== "undefined"
-        ? String(options.jobId)
-        : null;
-
-    class ManualAbortError extends Error {
-      constructor() {
-        super("BROWSER_WINDOW_CLOSED");
-        this.name = "ManualAbortError";
-      }
-    }
-
-    let abortedByUser = false;
-    let manualAbortTriggered = false;
-    const markAbort = () => {
-      abortedByUser = true;
-    };
-
-    page.on("close", markAbort);
-    page.on("crash", markAbort);
-    browser.on("disconnected", markAbort);
-
-    const isExternalAbortRequested = () =>
-      !!(abortToken && abortToken.aborted === true);
-
-    const isManualCloseError = (err) => {
-      if (!err || !err.message) return abortedByUser || page.isClosed();
-      const msg = err.message.toLowerCase();
-      return (
-        msg.includes("target closed") ||
-        msg.includes("browser has disconnected") ||
-        msg.includes("session closed") ||
-        msg.includes("execution context was destroyed") ||
-        msg.includes("cannot find context with specified id") ||
-        msg.includes("detached frame")
-      );
-    };
-
-    const isAbortRequested = () =>
-      abortedByUser || page.isClosed() || isExternalAbortRequested();
-
-    const runWithPage = async (task) => {
-      if (isAbortRequested()) {
-        throw new ManualAbortError();
-      }
-      try {
-        return await task();
-      } catch (err) {
-        if (isManualCloseError(err) || isExternalAbortRequested()) {
-          markAbort();
-          throw new ManualAbortError();
-        }
-        throw err;
-      }
-    };
-
-    const normalizedKeywords = Array.isArray(keywords)
-      ? keywords.map((kw) => String(kw || "").trim()).filter(Boolean)
-      : [String(keywords || "").trim()].filter(Boolean);
-    if (!normalizedKeywords.length) {
-      throw new Error("At least one keyword is required for scraping.");
-    }
-    const keywordConfigs = normalizedKeywords.map((kw) => ({
-      keyword: kw,
-      matchMode: "text",
-      synonyms: buildSynonymList(kw),
-    }));
-
-    const results = {
-      website: url,
-      keyword: keywordConfigs[0]?.keyword || "",
-      keywords: keywordConfigs.map((cfg) => cfg.keyword),
-      companyName: "",
-      metaDescription: "",
-      contactPageUrl: "",
-      contactPageContent: "",
-      extractedAddress: null,
-      extractedAddresses: [],
-      methodUsed: "",
-      keywordMatches: [],
-      keywordHit: null,
-      keywordSummaries: [],
-      jobId: crawlJobId || undefined,
-      partial: false,
-      crawlStatus: "running",
-      message: "",
-    };
-
-    const linkCapPerPage = null;
-    const matchLimit = null;
-
-    const maxDepth =
-      typeof requestedMaxDepth === "number" && requestedMaxDepth >= 0
-        ? requestedMaxDepth
-        : null;
-    const normalizedStart = normalizeUrl(url);
-    if (!normalizedStart) {
-      throw new Error("Unable to normalize start URL.");
-    }
-    const queue = [{ href: normalizedStart, depth: 0 }];
-    const isQueued = (href) => queue.some((entry) => entry.href === href);
-    const visited = new Set();
-    const keywordMatchBuckets = new Map(
-      keywordConfigs.map((cfg) => [cfg.keyword, []]),
-    );
-    const getMatchCountForKeyword = (keyword) => {
-      const bucket = keywordMatchBuckets.get(keyword);
-      return Array.isArray(bucket) ? bucket.length : 0;
-    };
-    const remainingAllowanceForKeyword = (keyword) => {
-      if (matchLimit === null) return null;
-      return Math.max(0, matchLimit - getMatchCountForKeyword(keyword));
-    };
-    const areAllKeywordLimitsSatisfied = () => {
-      if (matchLimit === null) return false;
-      for (const config of keywordConfigs) {
-        if (!config || !config.keyword) continue;
-        if (getMatchCountForKeyword(config.keyword) < matchLimit) {
-          return false;
-        }
-      }
-      return true;
-    };
-
-    try {
-      while (queue.length) {
-        if (isAbortRequested()) {
-          throw new ManualAbortError();
-        }
-        // if (matchLimit !== null && areAllKeywordLimitsSatisfied()) {
-        //   break;
-        // }
-        const nextEntry = queue.shift();
-        if (!nextEntry) continue;
-        const current = nextEntry.href;
-        const currentDepth =
-          typeof nextEntry.depth === "number" ? nextEntry.depth : 0;
-        if (!current || visited.has(current)) continue;
-        // if (maxDepth !== null && currentDepth > maxDepth) {
-        //   continue;
-        // }
-        visited.add(current);
-
-        try {
-          console.log(
-            `[crawler] Loading Page (depth ${currentDepth}): ${current}`,
-          );
-          await runWithPage(() =>
-            page.goto(current, {
-              waitUntil: "networkidle2",
-              timeout: 30000,
-            }),
-          );
-          await pause(5000); // pause to let dynamic content render before evaluation
-          if (isAbortRequested()) {
-            throw new ManualAbortError();
-          }
-        } catch (navErr) {
-          if (navErr instanceof ManualAbortError) {
-            throw navErr;
-          }
-          console.warn(`Navigation failed for ${current}:`, navErr.message);
-          continue;
-        }
-        const pageLanguage = await runWithPage(() =>
-          page.evaluate(() => {
-            try {
-              const langCandidates = [];
-              const htmlLang =
-                (document.documentElement &&
-                  document.documentElement.getAttribute("lang")) ||
-                "";
-              if (htmlLang) langCandidates.push(htmlLang);
-              const meta = document.querySelector(
-                "meta[http-equiv='content-language']",
-              );
-              const metaLang =
-                meta && meta.getAttribute ? meta.getAttribute("content") : "";
-              if (metaLang) langCandidates.push(metaLang);
-              if (navigator.language) langCandidates.push(navigator.language);
-              if (navigator.userLanguage)
-                langCandidates.push(navigator.userLanguage);
-              const normalized = langCandidates
-                .map((entry) => (entry || "").toString().trim().toLowerCase())
-                .filter(Boolean);
-              return normalized.length ? normalized[0] : "";
-            } catch {
-              return "";
-            }
-          }),
-        );
-        const normalizedLang = (pageLanguage || "").trim().toLowerCase();
-        const isEnglishPage =
-          !normalizedLang || normalizedLang.startsWith("en");
-        if (!isEnglishPage) {
-          console.log(
-            `[crawler] Skipping non-English page (lang=${
-              normalizedLang || "unknown"
-            }): ${current}`,
-          );
-          continue;
-        }
-
-        if (current === normalizedStart) {
-          const homeInfo = await runWithPage(() =>
-            page.evaluate(() => {
-              return {
-                title: document.title,
-                desc:
-                  document.querySelector('meta[name="description"]')?.content ||
-                  "",
-              };
-            }),
-          );
-          results.companyName = homeInfo.title;
-          results.metaDescription = homeInfo.desc;
-
-          if (!results.contactPageUrl) {
-            try {
-              const contactLink = await runWithPage(() =>
-                page.evaluate(() => {
-                  const anchors = Array.from(
-                    document.querySelectorAll("a[href]"),
-                  );
-                  const keywords = [
-                    "contact",
-                    "location",
-                    "locations",
-                    "find us",
-                    "office",
-                    "reach",
-                    "team",
-                    "leadership",
-                  ];
-                  const found = anchors.find((a) => {
-                    const text = (a.innerText || "").toLowerCase();
-                    const href = (a.getAttribute("href") || "").toLowerCase();
-                    return keywords.some(
-                      (k) => text.includes(k) || href.includes(k),
-                    );
-                  });
-                  return found ? found.href : null;
-                }),
-              );
-              if (contactLink) {
-                const normalizedContact = normalizeUrl(contactLink, current);
-                if (normalizedContact) {
-                  results.contactPageUrl = normalizedContact;
-                  if (
-                    !visited.has(normalizedContact) &&
-                    !isQueued(normalizedContact) &&
-                    (maxDepth === null || currentDepth + 1 <= maxDepth)
-                  ) {
-                    queue.push({
-                      href: normalizedContact,
-                      depth: currentDepth + 1,
-                    });
-                  }
-                }
-              }
-            } catch (err) {
-              if (err instanceof ManualAbortError) {
-                throw err;
-              }
-              console.warn(
-                "Contact page detection failed:",
-                err && err.message,
-              );
-            }
-          }
-        }
-
-        if (!results.extractedAddresses.length) {
-          try {
-            const extraction = await runWithPage(() =>
-              page.evaluate(() => {
-                const addrRegex =
-                  /\d{1,5}\s[\w\s\.]{1,30}(?:Street|Telephone|Toll-Free|Fax|St|Avenue|Ave|Road|Rd|Blvd|Drive|Dr|Court|Ct|Way|Lane|Ln|Suite|Ste|Floor|Fl|Square|Plaza)\.?\s*[\w\s,]{1,50}\d{4,5}/gi;
-                const phoneRegex =
-                  /(?:\+?1[-. ]?)?\(?([2-9][0-8][0-9])\)?[-. ]?([2-9][0-9]{2})[-. ]?([0-9]{4})/;
-                const STOP_LINE = /^(get directions|view map|directions|map)$/i;
-
-                const cleanBlock = (text = "") => {
-                  return text
-                    .replace(/\r/g, "")
-                    .split("\n")
-                    .map((line) => line.replace(/\u00a0/g, " ").trim())
-                    .filter((line) => line && !STOP_LINE.test(line))
-                    .join("\n")
-                    .trim();
-                };
-
-                const dedupe = (list) => {
-                  const seen = new Set();
-                  const unique = [];
-                  list.forEach((item) => {
-                    const normalized = item.replace(/\s+/g, " ").toLowerCase();
-                    if (!seen.has(normalized)) {
-                      seen.add(normalized);
-                      unique.push(item);
-                    }
-                  });
-                  return unique;
-                };
-
-                const hasAddress = (text) => {
-                  if (!text) return false;
-                  addrRegex.lastIndex = 0;
-                  return addrRegex.test(text);
-                };
-
-                const captureStructuredSections = () => {
-                  const sections = (document.body.innerText || "")
-                    .split(/\n\s*\n/g)
-                    .map((chunk) => cleanBlock(chunk))
-                    .filter(Boolean);
-                  return dedupe(sections.filter((block) => hasAddress(block)));
-                };
-
-                const pageContent = cleanBlock(
-                  (document.body && document.body.innerText) || "",
-                ).substring(0, 1200);
-
-                // 1. Capture entire sections/cards that contain address blocks
-                const sectionMatches = captureStructuredSections();
-                if (sectionMatches.length) {
-                  return {
-                    addresses: sectionMatches,
-                    method: "Section Capture",
-                    pageContent,
-                  };
-                }
-
-                // 2. Fall back to plain regex matches found anywhere on the page
-                const bodyText = document.body.innerText || "";
-                addrRegex.lastIndex = 0;
-                const addressMatch = bodyText.match(addrRegex) || [];
-                const cleanedMatches = dedupe(
-                  addressMatch
-                    .map((match) => cleanBlock(match))
-                    .filter(Boolean),
-                );
-
-                if (cleanedMatches.length) {
-                  return {
-                    addresses: cleanedMatches,
-                    method: "Standard Regex",
-                    pageContent,
-                  };
-                }
-
-                // 3. Phone Number Anchor Logic (Fallback)
-                const elements = Array.from(
-                  document.querySelectorAll("div, p, span, li, address"),
-                );
-                const fallbackAddresses = [];
-                for (let el of elements) {
-                  const text = (el.innerText || "").trim();
-                  if (!text) continue;
-                  if (!phoneRegex.test(text)) continue;
-
-                  const candidateContainer =
-                    el.closest(
-                      "address, article, section, li, [class*='location'], [class*='office'], [class*='contact'], [class*='branch'], [class*='card']",
-                    ) || el.parentElement;
-
-                  const parentText = candidateContainer
-                    ? candidateContainer.innerText
-                    : el.innerText;
-
-                  if (
-                    /\d+/.test(parentText) &&
-                    (/\d{5}/.test(parentText) ||
-                      /St|Ave|Rd|Drive|Suite|Box/i.test(parentText))
-                  ) {
-                    const snippet = cleanBlock(parentText)
-                      .substring(0, 600)
-                      .trim();
-                    if (snippet) {
-                      fallbackAddresses.push(snippet);
-                    }
-                  }
-                }
-
-                const cleanedFallback = dedupe(fallbackAddresses);
-                if (cleanedFallback.length) {
-                  return {
-                    addresses: cleanedFallback,
-                    method: "Phone Anchor Proximity",
-                    pageContent,
-                  };
-                }
-
-                return { addresses: [], method: "Failed", pageContent };
-              }),
-            );
-
-            if (
-              extraction &&
-              extraction.addresses &&
-              extraction.addresses.length
-            ) {
-              results.extractedAddresses = extraction.addresses;
-              results.extractedAddress = extraction.addresses.join(" | ");
-              results.methodUsed = extraction.method;
-              if (!results.contactPageUrl) {
-                results.contactPageUrl = current;
-              }
-              if (extraction.pageContent) {
-                results.contactPageContent = extraction.pageContent;
-              }
-            }
-          } catch (err) {
-            if (err instanceof ManualAbortError) {
-              throw err;
-            }
-            console.warn("Address extraction failed:", err && err.message);
-          }
-        }
-
-        try {
-          for (const config of keywordConfigs) {
-            if (!config || !config.keyword) continue;
-            const remainingBudgetForKeyword = remainingAllowanceForKeyword(
-              config.keyword,
-            );
-            if (remainingBudgetForKeyword === 0) {
-              continue;
-            }
-            const perPageMatchLimit =
-              remainingBudgetForKeyword !== null &&
-              remainingBudgetForKeyword > 0
-                ? remainingBudgetForKeyword
-                : null;
-            const pageMatches = await runWithPage(() =>
-              page.evaluate(
-                async ({
-                  keyword,
-                  synonyms,
-                  nodeLimit,
-                  perPageMatchLimit,
-                  scanTimeoutMs,
-                  nodeTextLimit,
-                }) => {
-                  const clean = (value = "") =>
-                    value.replace(/\s+/g, " ").trim();
-                  const escapeRegex = (value = "") =>
-                    value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-                  const normalized = (keyword || "").trim();
-                  if (!normalized) return [];
-                  const hasPerf =
-                    typeof performance !== "undefined" &&
-                    typeof performance.now === "function";
-                  const now = () => (hasPerf ? performance.now() : Date.now());
-                  const timeoutMs =
-                    typeof scanTimeoutMs === "number" && scanTimeoutMs > 0
-                      ? scanTimeoutMs
-                      : Number.POSITIVE_INFINITY;
-                  const deadline = now() + timeoutMs;
-                  const timedOut = () => now() >= deadline;
-                  const pause = () =>
-                    new Promise((resolve) => requestAnimationFrame(resolve));
-
-                  const lower = normalized.toLowerCase();
-                  const providedSynonyms = Array.isArray(synonyms)
-                    ? synonyms.filter(Boolean)
-                    : [];
-                  const labels = providedSynonyms.length
-                    ? providedSynonyms
-                    : [normalized, lower];
-
-                  const labelRegex = new RegExp(
-                    labels
-                      .map((label) => escapeRegex(label.toLowerCase()))
-                      .join("|"),
-                    "i",
-                  );
-
-                  const selectors = [
-                    "article",
-                    "section",
-                    "li",
-                    "div",
-                    "tr",
-                    "p",
-                    "h1",
-                    "h2",
-                    "h3",
-                    "h4",
-                    "h5",
-                    "h6",
-                    "dt",
-                    "dd",
-                    "span",
-                  ];
-                  const selectorString = selectors.join(",");
-                  const chunkSize =
-                    typeof nodeLimit === "number" && nodeLimit > 0
-                      ? nodeLimit
-                      : Number.POSITIVE_INFINITY;
-                  const chunkingEnabled =
-                    Number.isFinite(chunkSize) && chunkSize > 0;
-                  const maxTextLength =
-                    typeof nodeTextLimit === "number" && nodeTextLimit > 0
-                      ? nodeTextLimit
-                      : Number.POSITIVE_INFINITY;
-                  const matches = [];
-                  const seenValues = new Set();
-                  const buildSnippet = (text = "") => {
-                    if (!text) return "";
-                    const snippetRegex = new RegExp(
-                      labelRegex.source,
-                      labelRegex.flags,
-                    );
-                    const match = snippetRegex.exec(text);
-                    if (!match || typeof match.index !== "number") {
-                      return text.slice(0, 400).trim();
-                    }
-                    const window = 200;
-                    const start = Math.max(match.index - window, 0);
-                    const end = Math.min(
-                      match.index + match[0].length + window,
-                      text.length,
-                    );
-                    return text.slice(start, end).trim();
-                  };
-
-                  const processNode = (node) => {
-                    if (!node || node.nodeType !== 1) {
-                      return false;
-                    }
-                    const raw = node.textContent || "";
-                    if (!raw) return false;
-                    const limited =
-                      raw.length > maxTextLength
-                        ? raw.slice(0, maxTextLength)
-                        : raw;
-                    const normalizedText = clean(limited);
-                    if (!normalizedText || !labelRegex.test(normalizedText)) {
-                      return false;
-                    }
-
-                    const snippet = buildSnippet(normalizedText);
-                    if (!snippet) {
-                      return false;
-                    }
-
-                    if (seenValues.has(snippet)) {
-                      return false;
-                    }
-                    seenValues.add(snippet);
-
-                    matches.push({
-                      value: snippet,
-                      snippet,
-                      confidence: 100,
-                      numericValue: null,
-                    });
-
-                    return (
-                      typeof perPageMatchLimit === "number" &&
-                      perPageMatchLimit > 0 &&
-                      matches.length >= perPageMatchLimit
-                    );
-                  };
-
-                  const shouldStop = () =>
-                    timedOut() ||
-                    (typeof perPageMatchLimit === "number" &&
-                      perPageMatchLimit > 0 &&
-                      matches.length >= perPageMatchLimit);
-
-                  const maybeScroll = async () => {
-                    if (timedOut()) return;
-                    const scroller =
-                      document.scrollingElement ||
-                      document.documentElement ||
-                      document.body;
-                    if (!scroller) {
-                      await pause();
-                      return;
-                    }
-                    const step = Math.max(
-                      (window.innerHeight || 600) * 0.8,
-                      400,
-                    );
-                    const next =
-                      scroller.scrollTop + step >= scroller.scrollHeight
-                        ? scroller.scrollHeight
-                        : scroller.scrollTop + step;
-                    if (next !== scroller.scrollTop) {
-                      scroller.scrollTop = next;
-                      await pause();
-                    } else {
-                      await pause();
-                    }
-                  };
-
-                  const root = document.body || document.documentElement;
-                  let processed = 0;
-                  if (
-                    root &&
-                    typeof document.createNodeIterator === "function" &&
-                    typeof NodeFilter !== "undefined"
-                  ) {
-                    const iterator = document.createNodeIterator(
-                      root,
-                      NodeFilter.SHOW_ELEMENT,
-                      {
-                        acceptNode(node) {
-                          if (
-                            !node ||
-                            node.nodeType !== 1 ||
-                            typeof node.matches !== "function"
-                          ) {
-                            return NodeFilter.FILTER_SKIP;
-                          }
-                          return node.matches(selectorString)
-                            ? NodeFilter.FILTER_ACCEPT
-                            : NodeFilter.FILTER_SKIP;
-                        },
-                      },
-                    );
-                    let current;
-                    while (!shouldStop() && (current = iterator.nextNode())) {
-                      processed += 1;
-                      const shouldBreak = processNode(current);
-                      if (
-                        chunkingEnabled &&
-                        processed > 0 &&
-                        processed % chunkSize === 0
-                      ) {
-                        await maybeScroll();
-                      }
-                      if (shouldBreak || shouldStop()) {
-                        break;
-                      }
-                    }
-                  } else if (root) {
-                    const fallbackNodes = root.querySelectorAll(selectorString);
-                    for (let i = 0; i < fallbackNodes.length; i += 1) {
-                      if (shouldStop()) break;
-                      processed += 1;
-                      const shouldBreak = processNode(fallbackNodes[i]);
-                      if (
-                        chunkingEnabled &&
-                        processed > 0 &&
-                        processed % chunkSize === 0
-                      ) {
-                        await maybeScroll();
-                      }
-                      if (shouldBreak) {
-                        break;
-                      }
-                    }
-                  }
-
-                  return typeof perPageMatchLimit === "number" &&
-                    perPageMatchLimit > 0
-                    ? matches.slice(0, perPageMatchLimit)
-                    : matches;
-                },
-                {
-                  keyword: config.keyword,
-                  synonyms: config.synonyms,
-                  nodeLimit: null,
-                  perPageMatchLimit,
-                  scanTimeoutMs: null,
-                  nodeTextLimit: null,
-                },
-              ),
-            );
-
-            if (Array.isArray(pageMatches) && pageMatches.length) {
-              const bucket = keywordMatchBuckets.get(config.keyword);
-              if (!bucket) continue;
-              for (const match of pageMatches) {
-                if (matchLimit !== null && bucket.length >= matchLimit) {
-                  break;
-                }
-                bucket.push({
-                  ...match,
-                  pageUrl: current,
-                });
-              }
-            }
-          }
-        } catch (err) {
-          if (err instanceof ManualAbortError) {
-            throw err;
-          }
-          console.warn("Keyword extraction failed:", err && err.message);
-        }
-
-        let prioritizedLinks = [];
-        try {
-          prioritizedLinks = await runWithPage(() =>
-            page.evaluate(
-              ({ seedUrl, pattern, flags }) => {
-                const anchors = Array.from(
-                  document.querySelectorAll("a[href]"),
-                );
-                const seen = new Set();
-                const collected = [];
-                let source = null;
-                const regex = new RegExp(pattern, flags);
-                try {
-                  source = new URL(seedUrl);
-                } catch {
-                  source = null;
-                }
-
-                for (const anchor of anchors) {
-                  const href = anchor.getAttribute("href");
-                  if (!href) continue;
-                  let normalized;
-                  try {
-                    normalized = new URL(href, seedUrl).href;
-                  } catch {
-                    continue;
-                  }
-                  if (seen.has(normalized)) continue;
-
-                  if (source) {
-                    try {
-                      if (new URL(normalized).origin !== source.origin)
-                        continue;
-                    } catch {
-                      continue;
-                    }
-                  }
-
-                  const text = (anchor.innerText || "").toLowerCase();
-                  const hrefLower = normalized.toLowerCase();
-                  if (!regex.test(text) && !regex.test(hrefLower)) {
-                    continue;
-                  }
-
-                  seen.add(normalized);
-                  collected.push(normalized);
-                  if (collected.length >= 20) break;
-                }
-                return collected;
-              },
-              {
-                seedUrl: current,
-                pattern: PRIORITY_LINK_REGEX.source,
-                flags: "i",
-              },
-            ),
-          );
-        } catch (err) {
-          if (err instanceof ManualAbortError) {
-            throw err;
-          }
-          prioritizedLinks = [];
-        }
-
-        for (const link of prioritizedLinks || []) {
-          const normalizedLink = normalizeUrl(link, current);
-          if (!normalizedLink) continue;
-          if (visited.has(normalizedLink)) continue;
-          if (isQueued(normalizedLink)) continue;
-          if (maxDepth !== null && currentDepth + 1 > maxDepth) continue;
-          queue.push({ href: normalizedLink, depth: currentDepth + 1 });
-        }
-
-        let discoveredLinks = [];
-        try {
-          discoveredLinks = await runWithPage(() =>
-            page.evaluate(
-              ({ seedUrl, limit }) => {
-                const anchors = Array.from(
-                  document.querySelectorAll("a[href]"),
-                );
-                const seen = new Set();
-                const collected = [];
-                let source = null;
-                try {
-                  source = new URL(seedUrl);
-                } catch {
-                  source = null;
-                }
-                const hasLimit =
-                  typeof limit === "number" &&
-                  Number.isFinite(limit) &&
-                  limit > 0;
-                for (const anchor of anchors) {
-                  if (hasLimit && collected.length >= limit) break;
-                  const rawHref = anchor.getAttribute("href") || "";
-                  if (!rawHref || rawHref.startsWith("#")) continue;
-                  if (/^(javascript:|mailto:|tel:)/i.test(rawHref)) continue;
-                  let normalized;
-                  try {
-                    normalized = new URL(rawHref, seedUrl).href;
-                  } catch {
-                    continue;
-                  }
-                  if (seen.has(normalized)) continue;
-                  if (source) {
-                    try {
-                      if (new URL(normalized).origin !== source.origin) {
-                        continue;
-                      }
-                    } catch {
-                      continue;
-                    }
-                  }
-                  seen.add(normalized);
-                  collected.push(normalized);
-                }
-                return collected;
-              },
-              { seedUrl: current, limit: linkCapPerPage },
-            ),
-          );
-        } catch (err) {
-          if (err instanceof ManualAbortError) {
-            throw err;
-          }
-          discoveredLinks = [];
-        }
-
-        for (const link of discoveredLinks || []) {
-          const normalizedLink = normalizeUrl(link, current);
-          if (!normalizedLink) continue;
-          if (visited.has(normalizedLink)) continue;
-          if (isQueued(normalizedLink)) continue;
-          if (maxDepth !== null && currentDepth + 1 > maxDepth) continue;
-          queue.push({ href: normalizedLink, depth: currentDepth + 1 });
-        }
-
-        if (matchLimit !== null && areAllKeywordLimitsSatisfied()) {
-          break;
-        }
-      }
-    } catch (err) {
-      if (err instanceof ManualAbortError) {
-        manualAbortTriggered = true;
-      } else {
-        throw err;
-      }
-    } finally {
-      try {
-        await browser.close();
-      } catch {}
-    }
-
-    const summaries = keywordConfigs.map((config) => {
-      const matches = keywordMatchBuckets.get(config.keyword) || [];
-      const summary = summarizeKeywordMatches(
-        matches,
-        config.matchMode,
-        matchLimit,
-      );
-      return {
-        keyword: config.keyword,
-        matchMode: config.matchMode,
-        keywordMatches: summary.keywordMatches,
-        keywordHit: summary.keywordHit,
-      };
-    });
-    results.keywordSummaries = summaries;
-    const primarySummary = summaries[0] || {
-      keywordMatches: [],
-      keywordHit: null,
-    };
-    results.keywordMatches = primarySummary.keywordMatches;
-    results.keywordHit = primarySummary.keywordHit;
-
-    const externalStop = isExternalAbortRequested();
-    if (abortedByUser || manualAbortTriggered || externalStop) {
-      results.partial = true;
-      results.crawlStatus = externalStop ? "stopped" : "aborted";
-      results.message =
-        (abortToken && abortToken.reason) ||
-        results.message ||
-        (externalStop
-          ? "Crawl was stopped before completion."
-          : "Browser window was closed before crawl completed.");
-      if (!results.contactPageUrl) {
-        results.contactPageUrl = normalizedStart;
-      }
-    } else {
-      results.partial = false;
-      results.crawlStatus = "completed";
-      results.message = results.message || "";
-    }
-
-    return results;
-  }
-
-  function summarizeKeywordMatches(matches, _matchMode, cap = null) {
-    if (!Array.isArray(matches) || !matches.length) {
-      return { keywordMatches: [], keywordHit: null };
-    }
-
-    const seen = new Set();
-    const unique = [];
-    for (const match of matches) {
-      const key = `${(match.pageUrl || "").toLowerCase()}|${(
-        match.value || ""
-      ).toLowerCase()}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      unique.push(match);
-    }
-
-    unique.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
-
-    const limit = typeof cap === "number" && cap > 0 ? Math.floor(cap) : null;
-
-    return {
-      keywordMatches: limit !== null ? unique.slice(0, limit) : unique,
-      keywordHit: unique[0] || null,
-    };
-  }
-
-  // async function getCompanyDetailsFromGoogle(websiteUrl, apiKey) {
-  //   // 1. Clean the URL to use as a search query
-  //   const domain = websiteUrl
-  //     .replace(/^(?:https?:\/\/)?(?:www\.)?/i, "")
-  //     .split("/")[0];
-
-  //   const searchUrl = "https://places.googleapis.com/v1/places:searchText";
-
-  //   try {
-  //     console.log(`🔎 Searching Google for domain: ${domain}...`);
-
-  //     // STEP 1: Search for the place using the domain
-  //     const searchResponse = await axios.post(
-  //       searchUrl,
-  //       {
-  //         textQuery: domain,
-  //       },
-  //       {
-  //         headers: {
-  //           "Content-Type": "application/json",
-  //           "X-Goog-Api-Key": apiKey,
-  //           // Requesting only the specific fields we need to save on costs
-  //           "X-Goog-FieldMask":
-  //             "places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.websiteUri",
-  //         },
-  //       },
-  //     );
-
-  //     const places = searchResponse.data.places;
-
-  //     if (!places || places.length === 0) {
-  //       return {
-  //         error: "No matching business found on Google Maps for this website.",
-  //       };
-  //     }
-
-  //     // STEP 2: Filter results to ensure the website matches (Google might return similar names)
-  //     // We look for a result where the websiteUri contains our domain
-  //     const bestMatch =
-  //       places.find(
-  //         (p) =>
-  //           p.websiteUri &&
-  //           p.websiteUri.toLowerCase().includes(domain.toLowerCase()),
-  //       ) || places[0]; // Fallback to first result if no exact website match
-
-  //     return {
-  //       companyName: bestMatch.displayName.text,
-  //       address: bestMatch.formattedAddress,
-  //       phone: bestMatch.nationalPhoneNumber || "Not listed",
-  //       website: bestMatch.websiteUri,
-  //       googlePlaceId: bestMatch.id,
-  //     };
-  //   } catch (error) {
-  //     const errorMsg = error.response
-  //       ? JSON.stringify(error.response.data)
-  //       : error.message;
-  //     return { error: `API Request Failed: ${errorMsg}` };
-  //   }
-  // }
-
-  // const MY_API_KEY = "AIzaSyA9uBDTquLDGjnPA4y4YcJYddT56wZYawc";
-
-  // getCompanyDetailsFromGoogle(targetUrl, MY_API_KEY).then((data) => {
-  //   console.log("\n--- Google Business Result ---");
-  //   console.log(data);
-  // });
-
   try {
     const data = await scrapeFullCompanyData(targetUrl, keywords, maxDepth, {
       fullCrawl,
@@ -1529,6 +755,1162 @@ app.get("/search", async (req, res) => {
   }
 });
 
+const DEFAULT_SCRAPER_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+const UNWANTED_LINK_KEYWORDS = [
+  "news",
+  "newsroom",
+  "press",
+  "media",
+  "story",
+  "stories",
+  "article",
+  "articles",
+  "insight",
+  "insights",
+  "blog",
+  "blogs",
+  "events",
+  "event",
+  "webinar",
+  "webinars",
+  "case-study",
+  "case-studies",
+  "privacy",
+  "terms",
+  "terms-of",
+  "legal",
+  "policy",
+  "policies",
+  "cookie",
+  "cookies",
+  "disclaimer",
+];
+// const MAX_KEYWORD_MATCHES = 10;
+// const MAX_PAGES_SMART = 30;
+// const MAX_PAGES_FULL = 120;
+// const MAX_PDF_LINK_SCANS_PER_PAGE = 3;
+// const MAX_PDF_LINK_SCANS_TOTAL = 12;
+// const MAX_PDF_BYTES = 7 * 1024 * 1024; // 7 MB safety cap
+// const PDF_FETCH_TIMEOUT_MS = 20000;
+// const PDF_BROWSER_TIMEOUT_MS = 25000;
+// const PDF_SNIPPET_RADIUS = 180;
+
+function normalizeUrl(href, base) {
+  if (!href) return null;
+  const trimmed = String(href).trim();
+  if (!trimmed || trimmed.startsWith("#")) return null;
+  if (/^(javascript:|mailto:|tel:)/i.test(trimmed)) return null;
+  try {
+    const url = base ? new URL(trimmed, base) : new URL(trimmed);
+    url.hash = "";
+    let result = url.href;
+    if (result.length > url.origin.length + 1 && result.endsWith("/")) {
+      result = result.replace(/\/+$/, "");
+    }
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+function shouldSkipLinkCandidate(url) {
+  if (!url) return false;
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    parsed = null;
+  }
+
+  const pathname = (parsed && parsed.pathname ? parsed.pathname : url) || "";
+  const host = parsed && parsed.hostname ? parsed.hostname : "";
+  const search = parsed && parsed.search ? parsed.search : "";
+  const normalizedPath = pathname.trim().toLowerCase();
+  if (!normalizedPath || normalizedPath === "/") {
+    return false;
+  }
+  const haystack = `${host} ${normalizedPath} ${search}`.toLowerCase();
+  return UNWANTED_LINK_KEYWORDS.some((keyword) => haystack.includes(keyword));
+}
+
+function normalizeMatchFingerprintValue(value) {
+  if (value === null || typeof value === "undefined") return "";
+  return String(value).replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function buildKeywordMatchFingerprint(match) {
+  if (!match || typeof match !== "object") {
+    return null;
+  }
+  const snippetSource =
+    match.value || match.snippet || match.text || match.numericValue || "";
+  const normalizedSnippet = normalizeMatchFingerprintValue(snippetSource);
+  if (!normalizedSnippet) {
+    return null;
+  }
+  return normalizedSnippet;
+}
+
+function filterDuplicateMatches(matches) {
+  if (!Array.isArray(matches) || !matches.length) {
+    return [];
+  }
+  const seen = new Set();
+  const deduped = [];
+  for (const match of matches) {
+    const fingerprint = buildKeywordMatchFingerprint(match);
+    if (!fingerprint) continue;
+    if (seen.has(fingerprint)) continue;
+    seen.add(fingerprint);
+    deduped.push(match);
+  }
+  return deduped;
+}
+
+function removeContainedMatches(matches) {
+  if (!Array.isArray(matches) || !matches.length) {
+    return [];
+  }
+  const withNormalized = matches
+    .map((match, index) => {
+      const snippet =
+        match.value || match.snippet || match.text || match.numericValue || "";
+      const normalized = normalizeMatchFingerprintValue(snippet);
+      return normalized
+        ? { match, normalized, length: normalized.length, index }
+        : null;
+    })
+    .filter(Boolean);
+  if (!withNormalized.length) {
+    return [];
+  }
+  withNormalized.sort((a, b) => b.length - a.length);
+  const kept = [];
+  const normalizedKept = [];
+  for (const entry of withNormalized) {
+    const isContained = normalizedKept.some((existing) =>
+      existing.includes(entry.normalized),
+    );
+    if (isContained) continue;
+    kept.push(entry);
+    normalizedKept.push(entry.normalized);
+  }
+  kept.sort((a, b) => a.index - b.index);
+  return kept.map((entry) => entry.match);
+}
+
+function isBareDomainUrl(url) {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    const pathname = parsed.pathname || "/";
+    const search = parsed.search || "";
+    return (pathname === "/" || pathname === "") && !search;
+  } catch {
+    return false;
+  }
+}
+
+const pause = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function scrapeFullCompanyData(
+  url,
+  keywords,
+  requestedMaxDepth = null,
+  options = {},
+) {
+  const browser = await launchCrawlerBrowser();
+  const page = await browser.newPage();
+  await page.setUserAgent(DEFAULT_SCRAPER_UA);
+
+  const abortToken =
+    options && typeof options === "object" ? options.abortToken : null;
+  const crawlJobId =
+    options && typeof options.jobId !== "undefined"
+      ? String(options.jobId)
+      : null;
+
+  class ManualAbortError extends Error {
+    constructor() {
+      super("BROWSER_WINDOW_CLOSED");
+      this.name = "ManualAbortError";
+    }
+  }
+
+  let abortedByUser = false;
+  let manualAbortTriggered = false;
+  const markAbort = () => {
+    abortedByUser = true;
+  };
+
+  page.on("close", markAbort);
+  page.on("crash", markAbort);
+  browser.on("disconnected", markAbort);
+
+  const isExternalAbortRequested = () =>
+    !!(abortToken && abortToken.aborted === true);
+
+  const isManualCloseError = (err) => {
+    if (!err || !err.message) return abortedByUser || page.isClosed();
+    const msg = err.message.toLowerCase();
+    return (
+      msg.includes("target closed") ||
+      msg.includes("browser has disconnected") ||
+      msg.includes("session closed") ||
+      msg.includes("execution context was destroyed") ||
+      msg.includes("cannot find context with specified id") ||
+      msg.includes("detached frame")
+    );
+  };
+
+  const isAbortRequested = () =>
+    abortedByUser || page.isClosed() || isExternalAbortRequested();
+
+  const runWithPage = async (task) => {
+    if (isAbortRequested()) {
+      throw new ManualAbortError();
+    }
+    try {
+      return await task();
+    } catch (err) {
+      if (isManualCloseError(err) || isExternalAbortRequested()) {
+        markAbort();
+        throw new ManualAbortError();
+      }
+      throw err;
+    }
+  };
+
+  const normalizedKeywords = Array.isArray(keywords)
+    ? keywords.map((kw) => String(kw || "").trim()).filter(Boolean)
+    : [String(keywords || "").trim()].filter(Boolean);
+  if (!normalizedKeywords.length) {
+    throw new Error("At least one keyword is required for scraping.");
+  }
+  const keywordConfigs = normalizedKeywords.map((kw) => ({
+    keyword: kw,
+    matchMode: "text",
+    synonyms: buildSynonymList(kw),
+  }));
+
+  const keywordMatchBuckets = new Map(
+    keywordConfigs.map((cfg) => [cfg.keyword, []]),
+  );
+
+  const results = {
+    website: url,
+    keyword: keywordConfigs[0]?.keyword || "",
+    keywords: keywordConfigs.map((cfg) => cfg.keyword),
+    companyName: "",
+    metaDescription: "",
+    contactPageUrl: "",
+    contactPageContent: "",
+    extractedAddress: null,
+    extractedAddresses: [],
+    methodUsed: "",
+    keywordMatches: [],
+    keywordHit: null,
+    keywordSummaries: [],
+    jobId: crawlJobId || undefined,
+    partial: true,
+    crawlStatus: "running",
+    message: "Starting crawl...",
+    currentUrl: url,
+    currentDepth: 0,
+    visitedCount: 0,
+    queueSize: 1,
+    lastUpdated: Date.now(),
+  };
+
+  const rebuildKeywordSummaries = () => {
+    const summaries = keywordConfigs.map((config) => {
+      if (!config) return null;
+      const matches = keywordMatchBuckets.get(config.keyword) || [];
+      const summary = summarizeKeywordMatches(
+        matches,
+        config.matchMode,
+        matchLimit,
+      );
+      return {
+        keyword: config.keyword,
+        matchMode: config.matchMode,
+        keywordMatches: summary.keywordMatches,
+        keywordHit: summary.keywordHit,
+      };
+    });
+    results.keywordSummaries = summaries.filter(Boolean);
+    const primary = results.keywordSummaries[0];
+    results.keywordMatches = primary ? primary.keywordMatches : [];
+    results.keywordHit = primary ? primary.keywordHit : null;
+  };
+
+  let lastSnapshotEmit = 0;
+  const emitProgressSnapshot = (message, overrides = {}) => {
+    if (!crawlJobId) return;
+    const now = Date.now();
+    if (!message && now - lastSnapshotEmit < JOB_SNAPSHOT_THROTTLE_MS) {
+      return;
+    }
+    lastSnapshotEmit = now;
+    const snapshot = {
+      ...results,
+      ...overrides,
+      partial: true,
+      crawlStatus: "running",
+    };
+    snapshot.lastUpdated = Date.now();
+    snapshot.message =
+      overrides.message ||
+      message ||
+      snapshot.message ||
+      "Collecting company details...";
+    updateSearchJob(crawlJobId, snapshot, { status: "running" });
+  };
+
+  const linkCapPerPage = null;
+  const matchLimit = null;
+
+  const maxDepth =
+    typeof requestedMaxDepth === "number" && requestedMaxDepth >= 0
+      ? requestedMaxDepth
+      : null;
+  const normalizedStart = normalizeUrl(url);
+  if (!normalizedStart) {
+    throw new Error("Unable to normalize start URL.");
+  }
+  const queue = [{ href: normalizedStart, depth: 0 }];
+  const isQueued = (href) => queue.some((entry) => entry.href === href);
+  const visited = new Set();
+  let keywordLimitSatisfied = false;
+  const enqueueLinkCandidate = (candidate, parentUrl, parentDepth) => {
+    const normalizedLink = normalizeUrl(candidate, parentUrl);
+    if (!normalizedLink) return;
+    if (shouldSkipLinkCandidate(normalizedLink)) return;
+    if (visited.has(normalizedLink)) return;
+    if (isQueued(normalizedLink)) return;
+    const nextDepth = typeof parentDepth === "number" ? parentDepth + 1 : 1;
+    if (maxDepth !== null && nextDepth > maxDepth) return;
+    queue.push({ href: normalizedLink, depth: nextDepth });
+  };
+  const collectLinksFromPage = async (currentUrl, currentDepth) => {
+    let discoveredLinks = [];
+    try {
+      discoveredLinks = await runWithPage(() =>
+        page.evaluate(
+          ({ seedUrl, limit }) => {
+            const anchors = Array.from(document.querySelectorAll("a[href]"));
+            const seen = new Set();
+            const collected = [];
+            let source = null;
+            try {
+              source = new URL(seedUrl);
+            } catch {
+              source = null;
+            }
+            const hasLimit =
+              typeof limit === "number" && Number.isFinite(limit) && limit > 0;
+            for (const anchor of anchors) {
+              if (hasLimit && collected.length >= limit) break;
+              const rawHref = anchor.getAttribute("href") || "";
+              if (!rawHref || rawHref.startsWith("#")) continue;
+              if (/^(javascript:|mailto:|tel:)/i.test(rawHref)) continue;
+              let normalized;
+              try {
+                normalized = new URL(rawHref, seedUrl).href;
+              } catch {
+                continue;
+              }
+              if (seen.has(normalized)) continue;
+              if (source) {
+                try {
+                  if (new URL(normalized).origin !== source.origin) {
+                    continue;
+                  }
+                } catch {
+                  continue;
+                }
+              }
+              seen.add(normalized);
+              collected.push(normalized);
+            }
+            return collected;
+          },
+          { seedUrl: currentUrl, limit: linkCapPerPage },
+        ),
+      );
+    } catch (err) {
+      if (err instanceof ManualAbortError) {
+        throw err;
+      }
+      discoveredLinks = [];
+    }
+
+    for (const link of discoveredLinks || []) {
+      enqueueLinkCandidate(link, currentUrl, currentDepth);
+    }
+  };
+  const getMatchCountForKeyword = (keyword) => {
+    const bucket = keywordMatchBuckets.get(keyword);
+    return Array.isArray(bucket) ? bucket.length : 0;
+  };
+  const remainingAllowanceForKeyword = (keyword) => {
+    if (matchLimit === null) return null;
+    return Math.max(0, matchLimit - getMatchCountForKeyword(keyword));
+  };
+  const areAllKeywordLimitsSatisfied = () => {
+    if (matchLimit === null) return false;
+    for (const config of keywordConfigs) {
+      if (!config || !config.keyword) continue;
+      if (getMatchCountForKeyword(config.keyword) < matchLimit) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  try {
+    while (queue.length) {
+      if (keywordLimitSatisfied) break;
+      if (isAbortRequested()) {
+        throw new ManualAbortError();
+      }
+      // if (matchLimit !== null && areAllKeywordLimitsSatisfied()) {
+      //   break;
+      // }
+      const nextEntry = queue.shift();
+      if (!nextEntry) continue;
+      const current = nextEntry.href;
+      const currentDepth =
+        typeof nextEntry.depth === "number" ? nextEntry.depth : 0;
+      if (!current || visited.has(current)) continue;
+      // if (maxDepth !== null && currentDepth > maxDepth) {
+      //   continue;
+      // }
+      visited.add(current);
+      results.currentUrl = current;
+      results.currentDepth = currentDepth;
+      results.visitedCount = visited.size;
+      results.queueSize = queue.length;
+      emitProgressSnapshot();
+
+      try {
+        console.log(
+          `[crawler] Loading Page (depth ${currentDepth}): ${current}`,
+        );
+        await runWithPage(() =>
+          page.goto(current, {
+            waitUntil: "networkidle2",
+            timeout: 30000,
+          }),
+        );
+        await pause(5000); // pause to let dynamic content render before evaluation
+        if (isAbortRequested()) {
+          throw new ManualAbortError();
+        }
+      } catch (navErr) {
+        if (navErr instanceof ManualAbortError) {
+          throw navErr;
+        }
+        console.warn(`Navigation failed for ${current}:`, navErr.message);
+        continue;
+      }
+      const pageLanguage = await runWithPage(() =>
+        page.evaluate(() => {
+          try {
+            const langCandidates = [];
+            const htmlLang =
+              (document.documentElement &&
+                document.documentElement.getAttribute("lang")) ||
+              "";
+            if (htmlLang) langCandidates.push(htmlLang);
+            const meta = document.querySelector(
+              "meta[http-equiv='content-language']",
+            );
+            const metaLang =
+              meta && meta.getAttribute ? meta.getAttribute("content") : "";
+            if (metaLang) langCandidates.push(metaLang);
+            if (navigator.language) langCandidates.push(navigator.language);
+            if (navigator.userLanguage)
+              langCandidates.push(navigator.userLanguage);
+            const normalized = langCandidates
+              .map((entry) => (entry || "").toString().trim().toLowerCase())
+              .filter(Boolean);
+            return normalized.length ? normalized[0] : "";
+          } catch {
+            return "";
+          }
+        }),
+      );
+      const normalizedLang = (pageLanguage || "").trim().toLowerCase();
+      const isEnglishPage = !normalizedLang || normalizedLang.startsWith("en");
+      if (!isEnglishPage) {
+        console.log(
+          `[crawler] Skipping non-English page (lang=${
+            normalizedLang || "unknown"
+          }): ${current}`,
+        );
+        continue;
+      }
+
+      if (current === normalizedStart) {
+        const homeInfo = await runWithPage(() =>
+          page.evaluate(() => {
+            return {
+              title: document.title,
+              desc:
+                document.querySelector('meta[name="description"]')?.content ||
+                "",
+            };
+          }),
+        );
+        results.companyName = homeInfo.title;
+        results.metaDescription = homeInfo.desc;
+        emitProgressSnapshot("Captured homepage metadata");
+
+        if (!results.contactPageUrl) {
+          try {
+            const contactLink = await runWithPage(() =>
+              page.evaluate(() => {
+                const anchors = Array.from(
+                  document.querySelectorAll("a[href]"),
+                );
+                const keywords = [
+                  "contact",
+                  "location",
+                  "locations",
+                  "find us",
+                  "office",
+                  "reach",
+                  "team",
+                  "leadership",
+                ];
+                const found = anchors.find((a) => {
+                  const text = (a.innerText || "").toLowerCase();
+                  const href = (a.getAttribute("href") || "").toLowerCase();
+                  return keywords.some(
+                    (k) => text.includes(k) || href.includes(k),
+                  );
+                });
+                return found ? found.href : null;
+              }),
+            );
+            if (contactLink) {
+              const normalizedContact = normalizeUrl(contactLink, current);
+              if (normalizedContact) {
+                results.contactPageUrl = normalizedContact;
+                emitProgressSnapshot("Discovered contact page link");
+                if (
+                  !visited.has(normalizedContact) &&
+                  !isQueued(normalizedContact) &&
+                  (maxDepth === null || currentDepth + 1 <= maxDepth)
+                ) {
+                  queue.push({
+                    href: normalizedContact,
+                    depth: currentDepth + 1,
+                  });
+                }
+              }
+            }
+          } catch (err) {
+            if (err instanceof ManualAbortError) {
+              throw err;
+            }
+            console.warn("Contact page detection failed:", err && err.message);
+          }
+        }
+      }
+
+      if (currentDepth === 0 && isBareDomainUrl(current)) {
+        await collectLinksFromPage(current, currentDepth);
+        continue;
+      }
+
+      if (!results.extractedAddresses.length) {
+        try {
+          const extraction = await runWithPage(() =>
+            page.evaluate(() => {
+              const addrRegex =
+                /\d{1,5}\s[\w\s\.]{1,30}(?:Street|Telephone|Toll-Free|Fax|St|Avenue|Ave|Road|Rd|Blvd|Drive|Dr|Court|Ct|Way|Lane|Ln|Suite|Ste|Floor|Fl|Square|Plaza)\.?\s*[\w\s,]{1,50}\d{4,5}/gi;
+              const phoneRegex =
+                /(?:\+?1[-. ]?)?\(?([2-9][0-8][0-9])\)?[-. ]?([2-9][0-9]{2})[-. ]?([0-9]{4})/;
+              const STOP_LINE = /^(get directions|view map|directions|map)$/i;
+
+              const cleanBlock = (text = "") => {
+                return text
+                  .replace(/\r/g, "")
+                  .split("\n")
+                  .map((line) => line.replace(/\u00a0/g, " ").trim())
+                  .filter((line) => line && !STOP_LINE.test(line))
+                  .join("\n")
+                  .trim();
+              };
+
+              const dedupe = (list) => {
+                const seen = new Set();
+                const unique = [];
+                list.forEach((item) => {
+                  const normalized = item.replace(/\s+/g, " ").toLowerCase();
+                  if (!seen.has(normalized)) {
+                    seen.add(normalized);
+                    unique.push(item);
+                  }
+                });
+                return unique;
+              };
+
+              const hasAddress = (text) => {
+                if (!text) return false;
+                addrRegex.lastIndex = 0;
+                return addrRegex.test(text);
+              };
+
+              const captureStructuredSections = () => {
+                const sections = (document.body.innerText || "")
+                  .split(/\n\s*\n/g)
+                  .map((chunk) => cleanBlock(chunk))
+                  .filter(Boolean);
+                return dedupe(sections.filter((block) => hasAddress(block)));
+              };
+
+              const pageContent = cleanBlock(
+                (document.body && document.body.innerText) || "",
+              ).substring(0, 1200);
+
+              // 1. Capture entire sections/cards that contain address blocks
+              const sectionMatches = captureStructuredSections();
+              if (sectionMatches.length) {
+                return {
+                  addresses: sectionMatches,
+                  method: "Section Capture",
+                  pageContent,
+                };
+              }
+
+              // 2. Fall back to plain regex matches found anywhere on the page
+              const bodyText = document.body.innerText || "";
+              addrRegex.lastIndex = 0;
+              const addressMatch = bodyText.match(addrRegex) || [];
+              const cleanedMatches = dedupe(
+                addressMatch.map((match) => cleanBlock(match)).filter(Boolean),
+              );
+
+              if (cleanedMatches.length) {
+                return {
+                  addresses: cleanedMatches,
+                  method: "Standard Regex",
+                  pageContent,
+                };
+              }
+
+              // 3. Phone Number Anchor Logic (Fallback)
+              const elements = Array.from(
+                document.querySelectorAll("div, p, span, li, address"),
+              );
+              const fallbackAddresses = [];
+              for (let el of elements) {
+                const text = (el.innerText || "").trim();
+                if (!text) continue;
+                if (!phoneRegex.test(text)) continue;
+
+                const candidateContainer =
+                  el.closest(
+                    "address, article, section, li, [class*='location'], [class*='office'], [class*='contact'], [class*='branch'], [class*='card']",
+                  ) || el.parentElement;
+
+                const parentText = candidateContainer
+                  ? candidateContainer.innerText
+                  : el.innerText;
+
+                if (
+                  /\d+/.test(parentText) &&
+                  (/\d{5}/.test(parentText) ||
+                    /St|Ave|Rd|Drive|Suite|Box/i.test(parentText))
+                ) {
+                  const snippet = cleanBlock(parentText)
+                    .substring(0, 600)
+                    .trim();
+                  if (snippet) {
+                    fallbackAddresses.push(snippet);
+                  }
+                }
+              }
+
+              const cleanedFallback = dedupe(fallbackAddresses);
+              if (cleanedFallback.length) {
+                return {
+                  addresses: cleanedFallback,
+                  method: "Phone Anchor Proximity",
+                  pageContent,
+                };
+              }
+
+              return { addresses: [], method: "Failed", pageContent };
+            }),
+          );
+
+          if (
+            extraction &&
+            extraction.addresses &&
+            extraction.addresses.length
+          ) {
+            results.extractedAddresses = extraction.addresses;
+            results.extractedAddress = extraction.addresses.join(" | ");
+            results.methodUsed = extraction.method;
+            if (!results.contactPageUrl) {
+              results.contactPageUrl = current;
+            }
+            if (extraction.pageContent) {
+              results.contactPageContent = extraction.pageContent;
+            }
+            emitProgressSnapshot("Extracted contact details");
+          }
+        } catch (err) {
+          if (err instanceof ManualAbortError) {
+            throw err;
+          }
+          console.warn("Address extraction failed:", err && err.message);
+        }
+      }
+
+      try {
+        for (const config of keywordConfigs) {
+          if (!config || !config.keyword) continue;
+          const remainingBudgetForKeyword = remainingAllowanceForKeyword(
+            config.keyword,
+          );
+          if (remainingBudgetForKeyword === 0) {
+            continue;
+          }
+          const perPageMatchLimit =
+            remainingBudgetForKeyword !== null && remainingBudgetForKeyword > 0
+              ? remainingBudgetForKeyword
+              : null;
+          const pageMatches = await runWithPage(() =>
+            page.evaluate(
+              async ({
+                keyword,
+                synonyms,
+                nodeLimit,
+                perPageMatchLimit,
+                scanTimeoutMs,
+                nodeTextLimit,
+              }) => {
+                const clean = (value = "") => value.replace(/\s+/g, " ").trim();
+                const escapeRegex = (value = "") =>
+                  value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                const normalized = (keyword || "").trim();
+                if (!normalized) return [];
+                const hasPerf =
+                  typeof performance !== "undefined" &&
+                  typeof performance.now === "function";
+                const now = () => (hasPerf ? performance.now() : Date.now());
+                const timeoutMs =
+                  typeof scanTimeoutMs === "number" && scanTimeoutMs > 0
+                    ? scanTimeoutMs
+                    : Number.POSITIVE_INFINITY;
+                const deadline = now() + timeoutMs;
+                const timedOut = () => now() >= deadline;
+                const pause = () =>
+                  new Promise((resolve) => requestAnimationFrame(resolve));
+
+                const lower = normalized.toLowerCase();
+                const providedSynonyms = Array.isArray(synonyms)
+                  ? synonyms.filter(Boolean)
+                  : [];
+                const labels = providedSynonyms.length
+                  ? providedSynonyms
+                  : [normalized, lower];
+
+                const labelRegex = new RegExp(
+                  labels
+                    .map((label) => escapeRegex(label.toLowerCase()))
+                    .join("|"),
+                  "i",
+                );
+
+                const selectors = [
+                  "article",
+                  "section",
+                  "li",
+                  "div",
+                  "tr",
+                  "p",
+                  "h1",
+                  "h2",
+                  "h3",
+                  "h4",
+                  "h5",
+                  "h6",
+                  "dt",
+                  "dd",
+                  "span",
+                ];
+                const selectorString = selectors.join(",");
+                const chunkSize =
+                  typeof nodeLimit === "number" && nodeLimit > 0
+                    ? nodeLimit
+                    : Number.POSITIVE_INFINITY;
+                const chunkingEnabled =
+                  Number.isFinite(chunkSize) && chunkSize > 0;
+                const maxTextLength =
+                  typeof nodeTextLimit === "number" && nodeTextLimit > 0
+                    ? nodeTextLimit
+                    : Number.POSITIVE_INFINITY;
+                const matches = [];
+                const seenValues = new Set();
+                const buildSnippet = (text = "") => {
+                  if (!text) return "";
+                  const snippetRegex = new RegExp(
+                    labelRegex.source,
+                    labelRegex.flags,
+                  );
+                  const match = snippetRegex.exec(text);
+                  if (!match || typeof match.index !== "number") {
+                    return text.slice(0, 400).trim();
+                  }
+                  const window = 200;
+                  const start = Math.max(match.index - window, 0);
+                  const end = Math.min(
+                    match.index + match[0].length + window,
+                    text.length,
+                  );
+                  return text.slice(start, end).trim();
+                };
+
+                const processNode = (node) => {
+                  if (!node || node.nodeType !== 1) {
+                    return false;
+                  }
+                  const raw = node.textContent || "";
+                  if (!raw) return false;
+                  const limited =
+                    raw.length > maxTextLength
+                      ? raw.slice(0, maxTextLength)
+                      : raw;
+                  const normalizedText = clean(limited);
+                  if (!normalizedText || !labelRegex.test(normalizedText)) {
+                    return false;
+                  }
+
+                  const snippet = buildSnippet(normalizedText);
+                  if (!snippet) {
+                    return false;
+                  }
+
+                  if (seenValues.has(snippet)) {
+                    return false;
+                  }
+                  seenValues.add(snippet);
+
+                  matches.push({
+                    value: snippet,
+                    snippet,
+                    confidence: 100,
+                    numericValue: null,
+                  });
+
+                  return (
+                    typeof perPageMatchLimit === "number" &&
+                    perPageMatchLimit > 0 &&
+                    matches.length >= perPageMatchLimit
+                  );
+                };
+
+                const shouldStop = () =>
+                  timedOut() ||
+                  (typeof perPageMatchLimit === "number" &&
+                    perPageMatchLimit > 0 &&
+                    matches.length >= perPageMatchLimit);
+
+                const maybeScroll = async () => {
+                  if (timedOut()) return;
+                  const scroller =
+                    document.scrollingElement ||
+                    document.documentElement ||
+                    document.body;
+                  if (!scroller) {
+                    await pause();
+                    return;
+                  }
+                  const step = Math.max((window.innerHeight || 600) * 0.8, 400);
+                  const next =
+                    scroller.scrollTop + step >= scroller.scrollHeight
+                      ? scroller.scrollHeight
+                      : scroller.scrollTop + step;
+                  if (next !== scroller.scrollTop) {
+                    scroller.scrollTop = next;
+                    await pause();
+                  } else {
+                    await pause();
+                  }
+                };
+
+                const root = document.body || document.documentElement;
+                let processed = 0;
+                if (
+                  root &&
+                  typeof document.createNodeIterator === "function" &&
+                  typeof NodeFilter !== "undefined"
+                ) {
+                  const iterator = document.createNodeIterator(
+                    root,
+                    NodeFilter.SHOW_ELEMENT,
+                    {
+                      acceptNode(node) {
+                        if (
+                          !node ||
+                          node.nodeType !== 1 ||
+                          typeof node.matches !== "function"
+                        ) {
+                          return NodeFilter.FILTER_SKIP;
+                        }
+                        return node.matches(selectorString)
+                          ? NodeFilter.FILTER_ACCEPT
+                          : NodeFilter.FILTER_SKIP;
+                      },
+                    },
+                  );
+                  let current;
+                  while (!shouldStop() && (current = iterator.nextNode())) {
+                    processed += 1;
+                    const shouldBreak = processNode(current);
+                    if (
+                      chunkingEnabled &&
+                      processed > 0 &&
+                      processed % chunkSize === 0
+                    ) {
+                      await maybeScroll();
+                    }
+                    if (shouldBreak || shouldStop()) {
+                      break;
+                    }
+                  }
+                } else if (root) {
+                  const fallbackNodes = root.querySelectorAll(selectorString);
+                  for (let i = 0; i < fallbackNodes.length; i += 1) {
+                    if (shouldStop()) break;
+                    processed += 1;
+                    const shouldBreak = processNode(fallbackNodes[i]);
+                    if (
+                      chunkingEnabled &&
+                      processed > 0 &&
+                      processed % chunkSize === 0
+                    ) {
+                      await maybeScroll();
+                    }
+                    if (shouldBreak) {
+                      break;
+                    }
+                  }
+                }
+
+                return typeof perPageMatchLimit === "number" &&
+                  perPageMatchLimit > 0
+                  ? matches.slice(0, perPageMatchLimit)
+                  : matches;
+              },
+              {
+                keyword: config.keyword,
+                synonyms: config.synonyms,
+                nodeLimit: null,
+                perPageMatchLimit,
+                scanTimeoutMs: null,
+                nodeTextLimit: null,
+              },
+            ),
+          );
+
+          if (Array.isArray(pageMatches) && pageMatches.length) {
+            const bucket = keywordMatchBuckets.get(config.keyword);
+            if (!bucket) continue;
+            let newMatches = 0;
+            for (const match of pageMatches) {
+              if (matchLimit !== null && bucket.length >= matchLimit) {
+                break;
+              }
+              bucket.push({
+                ...match,
+                pageUrl: current,
+              });
+              newMatches += 1;
+            }
+            if (newMatches > 0) {
+              rebuildKeywordSummaries();
+              const totalMatches = Array.from(
+                keywordMatchBuckets.values(),
+              ).reduce(
+                (sum, entries) => sum + (entries ? entries.length : 0),
+                0,
+              );
+              emitProgressSnapshot(
+                `Found ${totalMatches} keyword match${totalMatches === 1 ? "" : "es"}`,
+              );
+              if (matchLimit !== null && areAllKeywordLimitsSatisfied()) {
+                keywordLimitSatisfied = true;
+                emitProgressSnapshot(
+                  `Captured ${matchLimit} matches for each keyword, stopping crawl.`,
+                );
+                break;
+              }
+            }
+          }
+          if (keywordLimitSatisfied) {
+            break;
+          }
+        }
+      } catch (err) {
+        if (err instanceof ManualAbortError) {
+          throw err;
+        }
+        console.warn("Keyword extraction failed:", err && err.message);
+      }
+
+      await collectLinksFromPage(current, currentDepth);
+
+      if (matchLimit !== null && areAllKeywordLimitsSatisfied()) {
+        keywordLimitSatisfied = true;
+        break;
+      }
+    }
+  } catch (err) {
+    if (err instanceof ManualAbortError) {
+      manualAbortTriggered = true;
+    } else {
+      throw err;
+    }
+  } finally {
+    try {
+      await browser.close();
+    } catch {}
+  }
+
+  for (const [keyword, entries] of keywordMatchBuckets.entries()) {
+    if (!Array.isArray(entries) || !entries.length) continue;
+    const deduped = filterDuplicateMatches(entries);
+    keywordMatchBuckets.set(keyword, removeContainedMatches(deduped));
+  }
+
+  rebuildKeywordSummaries();
+  const primarySummary = results.keywordSummaries[0] || {
+    keywordMatches: [],
+    keywordHit: null,
+  };
+  results.keywordMatches = primarySummary.keywordMatches;
+  results.keywordHit = primarySummary.keywordHit;
+  results.resultsLimited = !!keywordLimitSatisfied;
+
+  const externalStop = isExternalAbortRequested();
+  if (abortedByUser || manualAbortTriggered || externalStop) {
+    results.partial = true;
+    results.crawlStatus = externalStop ? "stopped" : "aborted";
+    results.message =
+      (abortToken && abortToken.reason) ||
+      results.message ||
+      (externalStop
+        ? "Crawl was stopped before completion."
+        : "Browser window was closed before crawl completed.");
+    if (!results.contactPageUrl) {
+      results.contactPageUrl = normalizedStart;
+    }
+  } else {
+    results.partial = false;
+    results.crawlStatus = "completed";
+    if (keywordLimitSatisfied && matchLimit !== null) {
+      results.message =
+        results.message ||
+        `Captured ${matchLimit} matches for each keyword and stopped early.`;
+    } else {
+      results.message = results.message || "";
+    }
+  }
+
+  return results;
+}
+
+function summarizeKeywordMatches(matches, _matchMode, cap = null) {
+  if (!Array.isArray(matches) || !matches.length) {
+    return { keywordMatches: [], keywordHit: null };
+  }
+
+  const unique = removeContainedMatches(filterDuplicateMatches(matches));
+  unique.sort((a, b) => (b.confidence || 0) - (a.confidence || 0));
+
+  const limit = typeof cap === "number" && cap > 0 ? Math.floor(cap) : null;
+
+  return {
+    keywordMatches: limit !== null ? unique.slice(0, limit) : unique,
+    keywordHit: unique[0] || null,
+  };
+}
+
+// async function getCompanyDetailsFromGoogle(websiteUrl, apiKey) {
+//   // 1. Clean the URL to use as a search query
+//   const domain = websiteUrl
+//     .replace(/^(?:https?:\/\/)?(?:www\.)?/i, "")
+//     .split("/")[0];
+
+//   const searchUrl = "https://places.googleapis.com/v1/places:searchText";
+
+//   try {
+//     console.log(`🔎 Searching Google for domain: ${domain}...`);
+
+//     // STEP 1: Search for the place using the domain
+//     const searchResponse = await axios.post(
+//       searchUrl,
+//       {
+//         textQuery: domain,
+//       },
+//       {
+//         headers: {
+//           "Content-Type": "application/json",
+//           "X-Goog-Api-Key": apiKey,
+//           // Requesting only the specific fields we need to save on costs
+//           "X-Goog-FieldMask":
+//             "places.id,places.displayName,places.formattedAddress,places.nationalPhoneNumber,places.websiteUri",
+//         },
+//       },
+//     );
+
+//     const places = searchResponse.data.places;
+
+//     if (!places || places.length === 0) {
+//       return {
+//         error: "No matching business found on Google Maps for this website.",
+//       };
+//     }
+
+//     // STEP 2: Filter results to ensure the website matches (Google might return similar names)
+//     // We look for a result where the websiteUri contains our domain
+//     const bestMatch =
+//       places.find(
+//         (p) =>
+//           p.websiteUri &&
+//           p.websiteUri.toLowerCase().includes(domain.toLowerCase()),
+//       ) || places[0]; // Fallback to first result if no exact website match
+
+//     return {
+//       companyName: bestMatch.displayName.text,
+//       address: bestMatch.formattedAddress,
+//       phone: bestMatch.nationalPhoneNumber || "Not listed",
+//       website: bestMatch.websiteUri,
+//       googlePlaceId: bestMatch.id,
+//     };
+//   } catch (error) {
+//     const errorMsg = error.response
+//       ? JSON.stringify(error.response.data)
+//       : error.message;
+//     return { error: `API Request Failed: ${errorMsg}` };
+//   }
+// }
+
+// const MY_API_KEY = "AIzaSyA9uBDTquLDGjnPA4y4YcJYddT56wZYawc";
+
+// getCompanyDetailsFromGoogle(targetUrl, MY_API_KEY).then((data) => {
+//   console.log("\n--- Google Business Result ---");
+//   console.log(data);
+// });
+
 app.post("/search/stop", (req, res) => {
   const jobId = (
     req.body && req.body.jobId ? String(req.body.jobId) : ""
@@ -1549,6 +1931,15 @@ app.post("/search/stop", (req, res) => {
   if (!entry.abortToken.reason) {
     entry.abortToken.reason = "Crawl stopped by user request.";
   }
+  const snapshot = entry.lastResult || {
+    website: entry.url,
+    keywords: entry.keywords || [],
+    partial: true,
+  };
+  snapshot.crawlStatus = "aborting";
+  snapshot.partial = true;
+  snapshot.message = entry.abortToken.reason;
+  updateSearchJob(jobId, snapshot, { status: "aborting", error: null });
   return res.json({ success: true, message: "Stop signal sent.", jobId });
 });
 

@@ -1,5 +1,5 @@
 import { HttpClient } from '@angular/common/http';
-import { Component } from '@angular/core';
+import { Component, OnDestroy } from '@angular/core';
 
 interface KeywordMatch {
   value: string;
@@ -39,14 +39,34 @@ interface CompanyData {
   keywordSummaries?: KeywordSummary[];
   jobId?: string;
   partial?: boolean;
-  crawlStatus?: 'completed' | 'aborted' | 'stopped';
+  crawlStatus?: 'completed' | 'aborted' | 'stopped' | 'running';
   message?: string;
+  source?: 'live' | 'cache';
+  cachedAt?: number;
+  cacheId?: string;
+  cacheDomain?: string;
+  relevanceStats?: {
+    kept: number;
+    skipped: number;
+  };
+  resultsLimited?: boolean;
+  currentUrl?: string;
+  currentDepth?: number;
+  visitedCount?: number;
+  queueSize?: number;
+  lastUpdated?: number;
 }
 
 interface SearchResponse {
   success: boolean;
   data?: CompanyData;
   error?: string;
+  cacheHit?: boolean;
+  jobId?: string;
+  status?: 'running' | 'completed' | 'failed' | 'aborted' | 'aborting';
+  completed?: boolean;
+  failed?: boolean;
+  updatedAt?: number;
 }
 
 interface GoogleSearchMatch {
@@ -92,21 +112,38 @@ interface GoogleSearchResponse {
             <small class="text-muted">
               Separate keywords with commas or new lines.
             </small>
+            <small class="text-muted d-block">
+              We'll check cached company pages first, then launch a fresh crawl
+              if needed.
+            </small>
           </div>
           <div class="col-12 mt-3" *ngIf="keywordTabs.length">
-            <div class="d-flex flex-wrap gap-2 mb-3">
+            <div
+              class="d-flex flex-wrap gap-2 mb-3 justify-content-between align-items-center"
+            >
+              <div class="d-flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  class="btn"
+                  [ngClass]="
+                    activeTab?.keyword === tab.keyword
+                      ? 'btn-primary text-white'
+                      : 'btn-outline-secondary'
+                  "
+                  *ngFor="let tab of keywordTabs"
+                  (click)="setActiveKeyword(tab.keyword)"
+                >
+                  {{ tab.keyword }} ({{ tab.matches.length }})
+                </button>
+              </div>
               <button
                 type="button"
-                class="btn"
-                [ngClass]="
-                  activeTab?.keyword === tab.keyword
-                    ? 'btn-primary text-white'
-                    : 'btn-outline-secondary'
-                "
-                *ngFor="let tab of keywordTabs"
-                (click)="setActiveKeyword(tab.keyword)"
+                class="btn btn-outline-primary"
+                (click)="exportKeywordMatches()"
+                [disabled]="!hasKeywordResults"
+                title="Download all extracted matches as CSV"
               >
-                {{ tab.keyword }} ({{ tab.matches.length }})
+                Export Results
               </button>
             </div>
             <ng-container *ngIf="activeTab as tab">
@@ -232,7 +269,11 @@ interface GoogleSearchResponse {
         </form>
 
         <div *ngIf="isSearching" class="alert alert-info mt-3">
-          Crawling site and collecting links...
+          {{
+            currentJobId
+              ? 'Crawling site and collecting links...'
+              : 'Checking cached crawl data...'
+          }}
         </div>
 
         <div *ngIf="error" class="alert alert-danger mt-3">
@@ -251,7 +292,21 @@ interface GoogleSearchResponse {
           <div *ngIf="result.partial" class="alert alert-warning">
             {{ result.message || 'Crawl stopped before completion.' }}
           </div>
+          <div
+            *ngIf="!result.partial && result.message"
+            class="alert alert-info"
+          >
+            {{ result.message }}
+          </div>
+          <div *ngIf="result.source === 'cache'" class="alert alert-info">
+            Showing cached crawl from
+            {{ result.cachedAt | date: 'short' }}.
+          </div>
           <h5 class="mb-2">Company Overview</h5>
+          <div class="text-muted small mb-2" *ngIf="result.relevanceStats">
+            Filtered {{ result.relevanceStats.kept }} relevant links and skipped
+            {{ result.relevanceStats.skipped || 0 }} low-signal matches.
+          </div>
           <div class="mb-2"><strong>Website:</strong> {{ result.website }}</div>
           <div class="mb-2" *ngIf="result.jobId">
             <strong>Job ID:</strong> {{ result.jobId }}
@@ -491,8 +546,10 @@ interface GoogleSearchResponse {
     `,
   ],
 })
-export class SearchComponent {
+export class SearchComponent implements OnDestroy {
   readonly KEYWORD_PAGE_SIZE = 15;
+  readonly API_BASE = 'http://localhost:3000';
+  private readonly STATUS_POLL_INTERVAL = 2000;
   keywordsInput = '';
   url = '';
   maxDepth = '';
@@ -508,8 +565,13 @@ export class SearchComponent {
   googleResultsLimit = 5;
   currentJobId: string | null = null;
   stopRequested = false;
+  private statusPollHandle: ReturnType<typeof setTimeout> | null = null;
 
   constructor(private http: HttpClient) {}
+
+  ngOnDestroy() {
+    this.cancelStatusPolling();
+  }
 
   async runSearch() {
     const trimmedUrl = this.url?.trim();
@@ -528,47 +590,12 @@ export class SearchComponent {
     this.activeKeyword = null;
     this.isSearching = true;
     this.stopRequested = false;
+    this.currentJobId = null;
+    this.cancelStatusPolling();
+    const baseParams = this.buildSearchParams(keywords);
     const jobId = this.generateJobId();
-    this.currentJobId = jobId;
-    const params: Record<string, string> = { url: this.url };
-    params['keywords'] = keywords.join(',');
-    params['keyword'] = keywords[0];
-    params['jobId'] = jobId;
-    if (
-      this.maxDepth !== '' &&
-      this.maxDepth !== null &&
-      this.maxDepth !== undefined
-    ) {
-      const depthValue = Number(this.maxDepth);
-      if (!Number.isNaN(depthValue) && depthValue >= 0) {
-        params['maxDepth'] = String(Math.floor(depthValue));
-      }
-    }
-    this.http
-      .get<SearchResponse>('https://gsp-coxk.onrender.com/search', {
-        params,
-      })
-      .subscribe({
-        next: (resp) => {
-          this.isSearching = false;
-          this.stopRequested = false;
-          this.currentJobId = null;
-          if (!resp.success || !resp.data) {
-            this.error =
-              resp.error || 'Unable to extract details for the provided URL.';
-            return;
-          }
-          this.result = resp.data;
-          this.setupKeywordTabs(resp.data);
-        },
-        error: (err) => {
-          this.isSearching = false;
-          this.stopRequested = false;
-          this.currentJobId = null;
-          this.error =
-            err?.message || 'Unexpected error while crawling the website.';
-        },
-      });
+    const liveParams = { ...baseParams, jobId };
+    this.tryCachedSearch(baseParams, liveParams, jobId);
   }
 
   stopSearch() {
@@ -580,7 +607,7 @@ export class SearchComponent {
       .post<{
         success: boolean;
         error?: string;
-      }>('https://gsp-coxk.onrender.com/search/stop', { jobId: this.currentJobId })
+      }>(`${this.API_BASE}/search/stop`, { jobId: this.currentJobId })
       .subscribe({
         error: (err) => {
           this.stopRequested = false;
@@ -615,6 +642,170 @@ export class SearchComponent {
       .slice(2, 10)}`;
   }
 
+  private buildSearchParams(keywords: string[]): Record<string, string> {
+    const params: Record<string, string> = { url: this.url };
+    params['keywords'] = keywords.join(',');
+    params['keyword'] = keywords[0];
+    if (
+      this.maxDepth !== '' &&
+      this.maxDepth !== null &&
+      this.maxDepth !== undefined
+    ) {
+      const depthValue = Number(this.maxDepth);
+      if (!Number.isNaN(depthValue) && depthValue >= 0) {
+        params['maxDepth'] = String(Math.floor(depthValue));
+      }
+    }
+    return params;
+  }
+
+  private tryCachedSearch(
+    cacheParams: Record<string, string>,
+    liveParams: Record<string, string>,
+    jobId: string,
+  ) {
+    this.http
+      .get<SearchResponse>(`${this.API_BASE}/search/cache`, {
+        params: cacheParams,
+      })
+      .subscribe({
+        next: (resp) => {
+          if (resp.success && resp.data) {
+            this.updateResultFromSnapshot({
+              ...resp.data,
+              source: 'cache',
+            });
+            this.markJobComplete();
+            return;
+          }
+          this.startLiveSearch(jobId, liveParams);
+        },
+        error: () => {
+          this.startLiveSearch(jobId, liveParams);
+        },
+      });
+  }
+
+  private startLiveSearch(jobId: string, params: Record<string, string>): void {
+    params['jobId'] = jobId;
+    this.currentJobId = jobId;
+    this.stopRequested = false;
+    this.result = null;
+    this.keywordTabs = [];
+    this.activeKeyword = null;
+    this.http
+      .get<SearchResponse>(`${this.API_BASE}/search/start`, {
+        params,
+      })
+      .subscribe({
+        next: (resp) => {
+          if (!resp.success || !(resp.jobId || jobId)) {
+            this.handleSearchError(
+              resp.error || 'Unable to start the crawl for the provided URL.',
+            );
+            return;
+          }
+          const activeJobId = resp.jobId || jobId;
+          this.currentJobId = activeJobId;
+          this.stopRequested = false;
+          this.scheduleStatusPoll(activeJobId, 0);
+        },
+        error: (err) => {
+          const message =
+            err?.error?.error ||
+            err?.message ||
+            'Unable to start the crawl for the provided URL.';
+          this.handleSearchError(message);
+        },
+      });
+  }
+
+  private pollJobStatus(jobId: string) {
+    if (!this.currentJobId || this.currentJobId !== jobId) {
+      return;
+    }
+    this.http
+      .get<SearchResponse>(`${this.API_BASE}/search/status`, {
+        params: { jobId },
+      })
+      .subscribe({
+        next: (resp) => {
+          if (!this.currentJobId || this.currentJobId !== jobId) {
+            return;
+          }
+          if (!resp.success) {
+            this.scheduleStatusPoll(jobId);
+            return;
+          }
+          if (resp.data) {
+            this.updateResultFromSnapshot(resp.data);
+          }
+          const status =
+            resp.status ||
+            (resp.completed ? 'completed' : resp.failed ? 'failed' : 'running');
+          const isFinal =
+            resp.completed ||
+            resp.failed ||
+            status === 'completed' ||
+            status === 'failed' ||
+            status === 'aborted';
+          if (isFinal) {
+            const errorMessage =
+              resp.error && status !== 'completed' ? resp.error : undefined;
+            this.markJobComplete(errorMessage);
+            return;
+          }
+          this.scheduleStatusPoll(jobId);
+        },
+        error: () => {
+          if (!this.currentJobId || this.currentJobId !== jobId) {
+            return;
+          }
+          this.scheduleStatusPoll(jobId);
+        },
+      });
+  }
+
+  private scheduleStatusPoll(jobId: string, delay = this.STATUS_POLL_INTERVAL) {
+    this.cancelStatusPolling();
+    this.statusPollHandle = setTimeout(() => this.pollJobStatus(jobId), delay);
+  }
+
+  private cancelStatusPolling() {
+    if (this.statusPollHandle) {
+      clearTimeout(this.statusPollHandle);
+      this.statusPollHandle = null;
+    }
+  }
+
+  private updateResultFromSnapshot(data: CompanyData) {
+    const preserveTabs = !!this.result && this.keywordTabs.length > 0;
+    const previousPages = preserveTabs
+      ? new Map(this.keywordTabs.map((tab) => [tab.keyword, tab.currentPage]))
+      : undefined;
+    this.result = data;
+    this.setupKeywordTabs(data, preserveTabs, previousPages);
+  }
+
+  private markJobComplete(errorMessage?: string) {
+    this.isSearching = false;
+    this.stopRequested = false;
+    this.cancelStatusPolling();
+    this.currentJobId = null;
+    this.error = errorMessage || null;
+  }
+
+  private handleSearchError(message: string) {
+    this.cancelStatusPolling();
+    this.isSearching = false;
+    this.stopRequested = false;
+    this.currentJobId = null;
+    this.result = null;
+    this.keywordTabs = [];
+    this.activeKeyword = null;
+    this.error = message;
+  }
+
   runGoogleSearch() {
     const trimmedUrl = this.url?.trim();
     if (!trimmedUrl || !this.keywordsInput.trim()) {
@@ -642,7 +833,7 @@ export class SearchComponent {
     this.googleResultsLimit = defaultMaxResults;
     params['maxResults'] = String(defaultMaxResults);
     this.http
-      .get<GoogleSearchResponse>('http://localhost:3000/google-search', {
+      .get<GoogleSearchResponse>(`${this.API_BASE}/google-search`, {
         params,
       })
       .subscribe({
@@ -683,6 +874,8 @@ export class SearchComponent {
     this.googleResultsLimit = 5;
     this.currentJobId = null;
     this.stopRequested = false;
+    this.isSearching = false;
+    this.cancelStatusPolling();
   }
 
   toGoogleQueryLink(query: string) {
@@ -730,12 +923,70 @@ export class SearchComponent {
     );
   }
 
+  get hasKeywordResults(): boolean {
+    return this.keywordTabs.some((tab) => tab.matches.length > 0);
+  }
+
   setActiveKeyword(keyword: string) {
     this.activeKeyword = keyword;
     const tab = this.activeTab;
     if (tab && tab.currentPage < 1) {
       tab.currentPage = 1;
     }
+  }
+
+  exportKeywordMatches(): void {
+    if (!this.hasKeywordResults) {
+      return;
+    }
+    const rows: Array<Record<string, string | number | null>> = [];
+    for (const tab of this.keywordTabs) {
+      for (const match of tab.matches) {
+        rows.push({
+          Keyword: tab.keyword,
+          Value: match.value || '',
+          Snippet: match.snippet || '',
+          'Page URL': match.pageUrl || '',
+          Section: match.section || '',
+          Confidence:
+            typeof match.confidence === 'number'
+              ? match.confidence.toFixed(2)
+              : '',
+          'Numeric Value':
+            typeof match.numericValue === 'number'
+              ? match.numericValue
+              : '',
+        });
+      }
+    }
+    if (!rows.length) {
+      return;
+    }
+    const headers = Object.keys(rows[0]);
+    const escape = (value: string | number | null) => {
+      if (value === null || value === undefined) {
+        return '""';
+      }
+      const text = String(value).replace(/"/g, '""');
+      return `"${text}"`;
+    };
+    const csvLines = [
+      headers.map((h) => escape(h)).join(','),
+      ...rows.map((row) => headers.map((h) => escape(row[h] ?? '')).join(',')),
+    ];
+    const blob = new Blob([csvLines.join('\r\n')], {
+      type: 'text/csv;charset=utf-8;',
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    const dateSuffix = new Date().toISOString().slice(0, 10);
+    link.download = `keyword-results-${dateSuffix}.csv`;
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
   }
 
   changeActivePage(delta: number) {
@@ -746,7 +997,12 @@ export class SearchComponent {
     tab.currentPage = next;
   }
 
-  private setupKeywordTabs(data: CompanyData) {
+  private setupKeywordTabs(
+    data: CompanyData,
+    preserveSelection = false,
+    previousPages?: Map<string, number>,
+  ) {
+    const previousActive = preserveSelection ? this.activeKeyword : null;
     const summaries =
       data.keywordSummaries && data.keywordSummaries.length
         ? data.keywordSummaries
@@ -757,11 +1013,29 @@ export class SearchComponent {
               keywordHit: data.keywordHit || null,
             },
           ];
-    this.keywordTabs = summaries.map((summary) => ({
-      keyword: summary.keyword || 'Keyword',
-      matches: summary.keywordMatches || [],
-      currentPage: 1,
-    }));
-    this.activeKeyword = this.keywordTabs[0]?.keyword || null;
+    this.keywordTabs = summaries.map((summary) => {
+      const keyword = summary.keyword || 'Keyword';
+      const storedPage = previousPages?.get(keyword) || 0;
+      const currentPage = storedPage > 0 ? storedPage : 1;
+      return {
+        keyword,
+        matches: summary.keywordMatches || [],
+        currentPage,
+      };
+    });
+    if (!this.keywordTabs.length) {
+      this.activeKeyword = null;
+      return;
+    }
+    if (preserveSelection && previousActive) {
+      const existing = this.keywordTabs.find(
+        (tab) => tab.keyword === previousActive,
+      );
+      this.activeKeyword = existing
+        ? existing.keyword
+        : this.keywordTabs[0].keyword;
+    } else {
+      this.activeKeyword = this.keywordTabs[0]?.keyword || null;
+    }
   }
 }
