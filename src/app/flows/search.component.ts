@@ -1,5 +1,6 @@
 import { HttpClient } from '@angular/common/http';
 import { Component, OnDestroy } from '@angular/core';
+import { ScrapeService } from '../scrape.service';
 
 interface KeywordMatch {
   value: string;
@@ -94,6 +95,8 @@ interface GoogleSearchResponse {
 @Component({
   selector: 'app-search',
   template: `
+    <button (click)="runSearch1()">Test LLM Extract</button>
+    LLM Results: {{ this.cleanJson | json }}
     <div class="card">
       <div class="card-header">Search</div>
       <div class="card-body">
@@ -566,8 +569,12 @@ export class SearchComponent implements OnDestroy {
   currentJobId: string | null = null;
   stopRequested = false;
   private statusPollHandle: ReturnType<typeof setTimeout> | null = null;
+  cleanJson: any;
 
-  constructor(private http: HttpClient) {}
+  constructor(
+    private http: HttpClient,
+    private scrapeService: ScrapeService,
+  ) {}
 
   ngOnDestroy() {
     this.cancelStatusPolling();
@@ -738,6 +745,7 @@ export class SearchComponent implements OnDestroy {
             return;
           }
           if (resp.data) {
+            console.log('Received crawl update:', resp.data);
             this.updateResultFromSnapshot(resp.data);
           }
           const status =
@@ -953,9 +961,7 @@ export class SearchComponent implements OnDestroy {
               ? match.confidence.toFixed(2)
               : '',
           'Numeric Value':
-            typeof match.numericValue === 'number'
-              ? match.numericValue
-              : '',
+            typeof match.numericValue === 'number' ? match.numericValue : '',
         });
       }
     }
@@ -1036,6 +1042,37 @@ export class SearchComponent implements OnDestroy {
         : this.keywordTabs[0].keyword;
     } else {
       this.activeKeyword = this.keywordTabs[0]?.keyword || null;
+    }
+  }
+
+  runSearch1(keywordSummaries?: any[]) {
+    try {
+      this.scrapeService.LLMExtract(this.result).subscribe((response: any) => {
+        console.log(
+          'LLM Extract Response:',
+          response.candidates[0].content.parts[0].text,
+        );
+        try {
+          // 1. Use regex to remove ```json at the start and ``` at the end
+          // It looks for everything between the first '{' and the last '}'
+          const jsonRegex = /\{[\s\S]*\}/;
+          const match =
+            response.candidates[0].content.parts[0].text.match(jsonRegex);
+
+          if (match) {
+            this.cleanJson = JSON.parse(match[0]);
+            console.log('Successfully parsed CEO:', this.cleanJson);
+
+            // Now you can assign it to your Angular model
+          } else {
+            console.error('No JSON object found in the response');
+          }
+        } catch (error) {
+          console.error('Parsing Error:', error);
+        }
+      });
+    } catch (error) {
+      console.error('Error during LLM extraction:', error);
     }
   }
 }

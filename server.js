@@ -758,8 +758,6 @@ app.get("/search", async (req, res) => {
 const DEFAULT_SCRAPER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
 const UNWANTED_LINK_KEYWORDS = [
-  "news",
-  "newsroom",
   "press",
   "media",
   "story",
@@ -768,8 +766,6 @@ const UNWANTED_LINK_KEYWORDS = [
   "articles",
   "insight",
   "insights",
-  "blog",
-  "blogs",
   "events",
   "event",
   "webinar",
